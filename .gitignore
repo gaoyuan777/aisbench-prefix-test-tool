@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# 运行时生成的临时文件
+temp_api.py
+tmp/
+
+# 测试产物
+outputs/
+aisbench.log
+aisbench_all.log
+aisbench_result.csv
+
+# 运行时指标实时文件
+pd_metrics_live.txt
+
+# 数据集生成的状态文件（记录已使用的 GSM8K 题目，删除后重新生成数据集可选到新题）
+picked_ids.txt
+
+# 本地真实配置备份（含内网地址，勿提交）
+config.py.local
