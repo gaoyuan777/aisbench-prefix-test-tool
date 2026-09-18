@@ -153,17 +153,6 @@ ROLE_LABELS = {
     "D": "D",
     "M": "混部",
 }
-KV_LINE_PALETTE = (
-    "#1f77b4",
-    "#ff7f0e",
-    "#2ca02c",
-    "#d62728",
-    "#9467bd",
-    "#8c564b",
-    "#e377c2",
-    "#7f7f7f",
-)
-
 DP_LINE_PALETTE = (
     "#1f77b4",
     "#ff7f0e",
@@ -1632,50 +1621,57 @@ def _adaptive_legend_box(fig, xaxis_key: str, yaxis_key: str, ys: List[Any], pre
     return _legend_style(x0 + (x1 - x0) * xf, y0 + (y1 - y0) * yf, xanchor, yanchor)
 
 
-def _kv_series_label(role: str, endpoint: str, series_keys: List[Tuple[str, str]]) -> str:
-    if role == "P":
-        base = "P Prefill"
-    elif role == "D":
-        base = "D Decode"
-    else:
-        base = "混部"
-    same_role = [key for key in series_keys if key[0] == role]
-    if len(same_role) > 1:
-        return f"{base} {endpoint}"
-    return base
-
-
 def _add_kv_lines(fig, samples: List[Dict[str, Any]], row: int, col: int, legend: str) -> None:
-    series_keys = []
+    """图2: 按角色聚合的 KV Cache 平均占用率折线。PD 分离时 P/D 各一条；per-DP 明细见图5/图8。"""
+    role_order: List[str] = []
+    role_endpoints: Dict[str, List[str]] = {}
     for sample in samples:
-        key = (sample["role"], sample["endpoint"])
-        if key not in series_keys:
-            series_keys.append(key)
-    for idx, (role, endpoint) in enumerate(series_keys):
-        xs, ys, hover = [], [], []
+        role = sample["role"]
+        if role not in role_endpoints:
+            role_order.append(role)
+            role_endpoints[role] = []
+        endpoint = sample["endpoint"]
+        if endpoint not in role_endpoints[role]:
+            role_endpoints[role].append(endpoint)
+    base_names = {"P": "P Prefill", "D": "D Decode", "M": "混部"}
+    for role in role_order:
+        multi = len(role_endpoints[role]) > 1
+        base = base_names.get(role, role_label(role))
+        name = f"{base} 平均（{len(role_endpoints[role])} 实例）" if multi else base
+        buckets: Dict[datetime, List[float]] = {}
         for sample in samples:
-            if sample["role"] != role or sample["endpoint"] != endpoint:
+            if sample["role"] != role:
                 continue
-            xs.append(_to_dt(sample["timestamp"]))
-            ys.append(sample.get("kv_cache_usage_pct"))
+            value = sample.get("kv_cache_usage_pct")
+            if value is None:
+                continue
+            ts = _to_dt(sample["timestamp"])
+            if ts is None:
+                continue
+            buckets.setdefault(ts.replace(microsecond=0), []).append(float(value))
+        if not buckets:
+            continue
+        xs, ys, hover = [], [], []
+        for key in sorted(buckets):
+            values = buckets[key]
+            avg = sum(values) / len(values)
+            suffix = f"（{len(values)} 实例平均）" if multi else ""
+            xs.append(key)
+            ys.append(avg)
             hover.append(
-                f"角色: {_kv_series_label(role, endpoint, series_keys)}<br>"
-                f"端点: {endpoint}<br>"
-                f"采集时间: {sample.get('timestamp')}<br>"
-                f"KV Cache 占用率: {_fmt_float(sample.get('kv_cache_usage_pct'), 2, '%')}"
+                f"角色: {name}<br>"
+                f"采集时间: {key.strftime('%Y-%m-%d %H:%M:%S')}<br>"
+                f"KV Cache 占用率: {_fmt_float(avg, 2, '%')}{suffix}"
             )
-        color = ROLE_COLORS.get(role, "#444444")
-        if role == "M" and sum(1 for key in series_keys if key[0] == "M") > 1:
-            color = KV_LINE_PALETTE[idx % len(KV_LINE_PALETTE)]
         fig.add_trace(
             go.Scatter(
                 x=xs,
                 y=ys,
                 mode="lines+markers",
-                name=_kv_series_label(role, endpoint, series_keys),
+                name=name,
                 legend=legend,
-                legendgroup=f"{legend}-{role}-{endpoint}",
-                line=dict(color=color, width=2),
+                legendgroup=f"{legend}-{role}",
+                line=dict(color=ROLE_COLORS.get(role, "#444444"), width=2),
                 marker=dict(size=5),
                 hovertemplate="%{text}<extra></extra>",
                 text=hover,
