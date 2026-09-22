@@ -260,13 +260,12 @@ def create_multi_prefix_dataset(tokenizer_path: str, input_len: int, number: int
         logging.error(f"生成数据集失败，请清空picked ids")
         exit(0)
 
-    prefix_dataset = []
-    for i in range(prefix_num):
-        for j in range(dp):
-            prefix_dataset.append(prefix_data[i])
+    # warmup 数据量 = prefix_num × 2 × dp（每前缀每 DP 域 2 条），前缀轮流填充
+    warmup_total = prefix_num * dp * 2
+    prefix_dataset = [prefix_data[i % prefix_num] for i in range(warmup_total)]
 
-    prefix_path = os.path.join(save_path, f'prefix-GSM8K-in{prefix_len}-num{dp*prefix_num}-{base_name}.jsonl')
-    write_data(prefix_path, prefix_dataset, dp*prefix_num)
+    prefix_path = os.path.join(save_path, f'prefix-GSM8K-in{prefix_len}-num{warmup_total}-{base_name}.jsonl')
+    write_data(prefix_path, prefix_dataset, warmup_total)
     if repeat_rate >= 1:
         dataset_path = os.path.join(save_path, f'GSM8K-in{prefix_len}-num{number}-{base_name}-repeatRate{repeat_rate}.jsonl')
         write_data(dataset_path, prefix_dataset, number)
@@ -318,12 +317,11 @@ def _create_prefix_dataset_variable(tokenizer_path, input_len, number, save_path
         prefix_data = [""] * prefix_num
 
     # 写前缀文件
-    prefix_dataset = []
-    for i in range(prefix_num):
-        for j in range(dp):
-            prefix_dataset.append(prefix_data[i])
-    prefix_path = os.path.join(save_path, f'prefix-GSM8K-in{max_common_len}-num{dp*prefix_num}-{base_name}.jsonl')
-    write_data(prefix_path, prefix_dataset, dp*prefix_num)
+    # warmup 数据量 = prefix_num × 2 × dp（每前缀每 DP 域 2 条），前缀轮流填充
+    warmup_total = prefix_num * dp * 2
+    prefix_dataset = [prefix_data[i % prefix_num] for i in range(warmup_total)]
+    prefix_path = os.path.join(save_path, f'prefix-GSM8K-in{max_common_len}-num{warmup_total}-{base_name}.jsonl')
+    write_data(prefix_path, prefix_dataset, warmup_total)
     if repeat_rate >= 1:
         dataset_path = os.path.join(save_path, f'GSM8K-in{max_common_len}-num{number}-{base_name}-repeatRate{repeat_rate}.jsonl')
         write_data(dataset_path, prefix_dataset, number)

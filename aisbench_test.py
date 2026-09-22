@@ -35,7 +35,7 @@ def parse_arguments():
     parser.add_argument("--test_accuracy", action='store_true', default=False, help="test accuracy")
     parser.add_argument("--npu_num", type=int, default=1, help="npu numbers")
     parser.add_argument("--dataset_type", type=str, default="normal", help="normal or prefix_cache")
-    parser.add_argument("--prefix_num", type=int, default=2, help="prefix numbers")
+    parser.add_argument("--prefix_num", type=int, default=1, help="prefix numbers")
     parser.add_argument("--repeat_rate", type=str, default="0", help="dataset repeat rate")
     parser.add_argument("--prefix_test", action='store_true', default=False, help="test prefix dataset firstly")
     parser.add_argument("--seed", type=int, default=1, help="dataset random seed")
@@ -70,7 +70,7 @@ def create_gsm8k_dataset(dataset_type, input_len, data_num, model_path, dataset_
         prefix_jsonl_path, dataset_jsonl_path = create_multi_prefix_dataset(model_path,input_len,data_num,dataset_path,1,dp,repeat_rate,seed,prefix_num,
                                                                              length_mean, length_std, length_min, length_max)
         logging.info("[完成] 数据集已生成：")
-        logging.info(f"  - 公共前缀：{prefix_jsonl_path}  (行数={dp*prefix_num})")
+        logging.info(f"  - 公共前缀：{prefix_jsonl_path}  (行数={prefix_num*dp*2}, 前缀数={prefix_num})")
         logging.info(f"  - 数据集：  {dataset_jsonl_path} (行数={data_num})")
         logging.info("[信息] 配置：")
         logging.info(f"  tokens(单条长度)={input_len}, prefix_ratio(前缀重复率)={repeat_rate}")
