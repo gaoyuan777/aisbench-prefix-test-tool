@@ -28,18 +28,29 @@ DEFAULT_PERFORMANCE_TEST = "default_perf"
 OUTPUT_DIR = "./outputs/default"
 
 # --prefix_test 各 DP 域命中率查询地址：
-#   prefix cache 命中发生在 P（Prefill）节点，至少列出全部 P 实例的各 DP 域端口
-#   注意是 vLLM 引擎端口，不是 proxy 端口
+#   prefix cache 命中发生在 P（Prefill）节点，注意是 vLLM 引擎端口，不是 proxy 端口
 #   格式 ["{ip}:{port}", ...]，留空 [] 则默认 HOST_IP:HOST_PORT（PD 形态下通常不正确，务必填写）
-# 示例：P 单机 dp=4，端口 9000-9003
+#   填法同样受 DP 部署形态影响（形态说明见下方 P_LISTEN_SERVER）：
+#     形态 A（单实例内部 DP）填 1 个地址即可；形态 B/C 列出全部端口
+# 示例：P 单机 dp=4 多实例，端口 9000-9003
 POD_INFO = ["192.168.1.11:9000", "192.168.1.11:9001", "192.168.1.11:9002", "192.168.1.11:9003"]
 
 # ===== 运行时指标监控（可选）=====
 # M_LISTEN_SERVER 必须留空，PD 分离监听才会生效（M 优先级最高）
 M_LISTEN_SERVER = ""
 
-# P（Prefill）/ D（Decode）节点各 DP 域的 metrics 端口，逗号分隔多个端点
-# 填 vLLM 引擎自身的 metrics 端口（不要填 proxy），留空 "" 则不监听该角色
-# 示例：P 192.168.1.11 dp=4 端口 9000-9003；D 192.168.1.12 dp=4 端口 10001-10004
+# P（Prefill）/ D（Decode）节点的 metrics 端点，留空 "" 则不监听该角色
+# 填 vLLM 引擎自身的 metrics 端口（不要填 proxy），多端点逗号分隔
+#
+# 按 DP 部署形态填写（三种形态详见 README「DP 部署形态与 metrics 配置」）：
+#   A. 单实例内部 DP：vllm serve --data-parallel-size 4 --api-server-count 1
+#      一个 metrics 端口返回全部 DP 域数据（prometheus engine 标签区分）→ 只填 1 个地址
+#   B. 多 API server：--data-parallel-size 4 --api-server-count 4（端口递增）
+#      每端口仅本 DP 域 → 列出全部端口
+#   C. 多实例外部 DP：launch_online_dp.py（每 DP 一个独立 vllm serve 进程，端口递增）
+#      每端口仅本实例 → 列出全部端口
+# 判定命令（服务运行时执行）：
+#   curl -s http://{ip}:{port}/metrics | grep -o 'engine="[0-9]*"' | sort -u
+#   返回 dp 数行（engine="0"~"3"）→ 形态 A 填 1 个地址；返回 1 行/空 → 形态 B/C 列全部端口
 P_LISTEN_SERVER = "192.168.1.11:9000,192.168.1.11:9001,192.168.1.11:9002,192.168.1.11:9003"
 D_LISTEN_SERVER = "192.168.1.12:10001,192.168.1.12:10002,192.168.1.12:10003,192.168.1.12:10004"

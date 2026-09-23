@@ -43,6 +43,25 @@ python3 aisbench_test.py --input_len 2048 --output_len 2048 --data_num 160 --con
 - `*_LISTEN_SERVER` 必须是 vLLM 引擎自身的 metrics 端口（多 DP 域逗号分隔），**不要填 proxy**（其 `/metrics` 常为 404）
 - `POD_INFO` 只服务 `--prefix_test` 的命中率统计，与运行时监控无关；留空 `[]` 默认 `HOST_IP:HOST_PORT`
 
+## DP 部署形态与 metrics 配置
+
+vLLM 的 DP 部署有三种形态，`/metrics` 暴露方式不同，直接决定 `POD_INFO` 与 `*_LISTEN_SERVER` 的填法：
+
+| 形态 | 部署方式 | metrics 端口 | 每端口返回 | 配置填法 |
+| --- | --- | --- | --- | --- |
+| A. 单实例内部 DP | `vllm serve --data-parallel-size 4 --api-server-count 1` | 1 个 | **全部 4 个 DP** 的数据（prometheus `engine="0"~"3"` 标签区分） | **填 1 个地址** |
+| B. 多 API server | 同上但 `--api-server-count 4`，端口递增 | 4 个 | 每端口仅本 DP 域 | 列出全部端口 |
+| C. 多实例外部 DP | `launch_online_dp.py`，每 DP 一个独立 `vllm serve` 进程，`--vllm-start-port` 递增 | 4 个 | 每端口仅本实例 | 列出全部端口 |
+
+服务运行时一条命令判定形态：
+
+```bash
+curl -s http://{ip}:{port}/metrics | grep -o 'engine="[0-9]*"' | sort -u
+# 返回 dp 数行（engine="0"~"3"）→ 形态 A，填 1 个地址；返回 1 行或空 → 形态 B/C，列全部端口
+```
+
+两种展开方式（1 地址 × N 个 engine 标签 / N 地址 × 各 1 个 engine）对监控等价：per-DP 图表与聚合平均线均正确，只需保证地址列表覆盖全部 DP 域。
+
 ## 命令行参数
 
 `python3 aisbench_test.py --help` 查看全部。
