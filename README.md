@@ -49,11 +49,30 @@ vLLM 的 DP 部署有三种形态，`/metrics` 暴露方式不同，直接决定
 
 以 dp=4、服务 IP `192.168.1.10`、起始端口 9000 为例：
 
-| 形态 | 部署方式 | metrics 端口 | 每端口返回 | `M_LISTEN_SERVER` / `POD_INFO` 用例 |
-| --- | --- | --- | --- | --- |
-| A. 单实例内部 DP | `vllm serve --data-parallel-size 4 --api-server-count 1` | 1 个 | **全部 4 个 DP** 的数据（prometheus `engine="0"~"3"` 标签区分） | `M_LISTEN_SERVER = "192.168.1.10:9000"`<br>`POD_INFO = ["192.168.1.10:9000"]` |
-| B. 多 API server | 同上但 `--api-server-count 4`，端口递增 | 4 个 | 每端口仅本 DP 域 | `M_LISTEN_SERVER = "192.168.1.10:9000,192.168.1.10:9001,192.168.1.10:9002,192.168.1.10:9003"`<br>`POD_INFO = ["192.168.1.10:9000", "192.168.1.10:9001", "192.168.1.10:9002", "192.168.1.10:9003"]` |
-| C. 多实例外部 DP | `launch_online_dp.py`，每 DP 一个独立 `vllm serve` 进程，`--vllm-start-port` 递增 | 4 个 | 每端口仅本实例 | 同形态 B |
+| 形态 | 部署方式 | metrics 端口 | 每端口返回 |
+| --- | --- | --- | --- |
+| A. 单实例内部 DP | `vllm serve --data-parallel-size 4 --api-server-count 1` | 1 个 | 全部 4 个 DP 的数据（prometheus `engine="0"~"3"` 标签区分） |
+| B. 多 API server | 同上但 `--api-server-count 4`，端口递增 | 4 个 | 每端口仅本 DP 域 |
+| C. 多实例外部 DP | `launch_online_dp.py`，每 DP 一个独立 `vllm serve` 进程，`--vllm-start-port` 递增 | 4 个 | 每端口仅本实例 |
+
+**配置用例**（dp=4、服务 IP `192.168.1.10`、起始端口 9000）：
+
+**形态 A**（填 1 个地址即可）：
+
+```python
+M_LISTEN_SERVER = "192.168.1.10:9000"
+POD_INFO = ["192.168.1.10:9000"]
+```
+
+**形态 B / C**（列出全部端口）：
+
+```python
+M_LISTEN_SERVER = "192.168.1.10:9000,192.168.1.10:9001,192.168.1.10:9002,192.168.1.10:9003"
+POD_INFO = [
+    "192.168.1.10:9000", "192.168.1.10:9001",
+    "192.168.1.10:9002", "192.168.1.10:9003",
+]
+```
 
 PD 分离场景将 `M_LISTEN_SERVER` 替换为 `P_LISTEN_SERVER` / `D_LISTEN_SERVER`，填法同理。
 
