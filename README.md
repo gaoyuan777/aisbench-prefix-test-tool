@@ -4,7 +4,7 @@
 
 > 项目来源：参考 [rayn-zzz/aisbench_auto_tools_prefix](https://github.com/rayn-zzz/aisbench_auto_tools_prefix) 部分内容重新设计开发。
 
-## 功能
+## 1. 功能
 
 - **性能测试**：定长/不定长输入、流式/非流式、思考模式、稳态测试
 - **Prefix Cache 测试**：自动生成带公共前缀的数据集，warmup 预热后跑全量，统计各 DP 域命中率
@@ -12,7 +12,7 @@
 - **数据集生成**：基于 GSM8K，可指定长度、前缀重复率、前缀个数
 - **精度测试**：GSM8K 格式数据集精度评估
 
-## 快速开始
+## 2. 快速开始
 
 ```bash
 # 进入带 ais_bench 的环境（mindie/vllm 镜像均已打包），另需安装：
@@ -30,7 +30,7 @@ python3 aisbench_test.py --input_len 2048 --output_len 2048 --data_num 160 --con
 
 `DATASET_PATH` 指向的文件夹需提前创建。
 
-## config.py 模板（二选一）
+## 3. config.py 模板（二选一）
 
 | 形态 | 模板文件 | 关键差异 |
 | --- | --- | --- |
@@ -43,7 +43,7 @@ python3 aisbench_test.py --input_len 2048 --output_len 2048 --data_num 160 --con
 - `*_LISTEN_SERVER` 必须是 vLLM 引擎自身的 metrics 端口（多 DP 域逗号分隔），**不要填 proxy**（其 `/metrics` 常为 404）
 - `POD_INFO` 只服务 `--prefix_test` 的命中率统计，与运行时监控无关；留空 `[]` 默认 `HOST_IP:HOST_PORT`
 
-## DP 部署形态与 metrics 配置
+## 4. DP 部署形态与 metrics 配置
 
 vLLM 的 DP 部署有三种形态，`/metrics` 暴露方式不同，直接决定 `POD_INFO` 与 `*_LISTEN_SERVER` 的填法：
 
@@ -85,7 +85,7 @@ curl -s http://{ip}:{port}/metrics | grep -o 'engine="[0-9]*"' | sort -u
 
 两种展开方式（1 地址 × N 个 engine 标签 / N 地址 × 各 1 个 engine）对监控等价：per-DP 图表与聚合平均线均正确，只需保证地址列表覆盖全部 DP 域。
 
-## 命令行参数
+## 5. 命令行参数
 
 `python3 aisbench_test.py --help` 查看全部。
 
@@ -110,7 +110,7 @@ curl -s http://{ip}:{port}/metrics | grep -o 'engine="[0-9]*"' | sort -u
 | `--output_dir` | 覆盖 config 的 `OUTPUT_DIR` |
 | `--length_mean/std/min/max` | 不定长数据集的长度分布参数 |
 
-## Prefix Cache 测试逻辑
+## 6. Prefix Cache 测试逻辑
 
 **数据集构造**：每条数据 = 公共前缀（`input_len × repeat_rate`）+ 3 个随机 token + 独立后缀；`prefix_num` 个不同前缀轮流挂载。
 
@@ -128,7 +128,7 @@ abc789   ← 前缀 abc
 ...
 ```
 
-## 使用示例
+## 7. 使用示例
 
 ```bash
 # 1. 普通性能测试
@@ -155,7 +155,7 @@ python3 aisbench_test.py --dataset "/mnt/data/medium.jsonl" --output_len 20 --co
 python3 aisbench_test.py --dataset "/mnt/data/gsm8k.jsonl" --output_len 1024 --concurrency 64 --request_rate 4 --test_accuracy
 ```
 
-## 运行时指标监控
+## 8. 运行时指标监控
 
 配置 `*_LISTEN_SERVER` 后，测试结束自动生成：
 
@@ -172,7 +172,7 @@ outputs/<目录>/<时间戳>/performances/vllm-api-stream-chat/vllm_pd_runtime_m
 
 所有时间轴图表联动缩放，底部附参数配置表。
 
-## 结果获取
+## 9. 结果获取
 
 | 产物 | 位置 |
 | --- | --- |
@@ -181,7 +181,7 @@ outputs/<目录>/<时间戳>/performances/vllm-api-stream-chat/vllm_pd_runtime_m
 | 命中率 | 打屏日志 + `aisbench_result.csv` + HTML 标题 |
 | 运行时指标 | 上文 HTML 路径 |
 
-## FAQ
+## 10. FAQ
 
 **1. 报错"生成数据集失败，请清空 picked ids"**：删除 `picked_ids.txt`。
 
@@ -193,10 +193,10 @@ outputs/<目录>/<时间戳>/performances/vllm-api-stream-chat/vllm_pd_runtime_m
 
 **5. tokenizer 加载失败**：检查 transformers 版本与模型适配性，部分模型需 `trust_remote_code=True`。
 
-## License
+## 11. License
 
 见 [LICENSE](LICENSE)。
 
-## 致谢
+## 12. 致谢
 
 本项目参考了 [rayn-zzz/aisbench_auto_tools_prefix](https://github.com/rayn-zzz/aisbench_auto_tools_prefix) 项目的部分内容，并在此基础上重新设计开发，感谢原作者的工作。
