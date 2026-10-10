@@ -20,8 +20,9 @@ HOST_PORT = "8000"
 # 鉴权信息（如服务未开启鉴权则留空）
 API_KEY = ""
 
-# 稳态测试改为 "stable_stage"，否则保持 "default_perf"
-DEFAULT_PERFORMANCE_TEST = "default_perf"
+# 性能统计口径：stable_stage（稳态窗口，默认）/ default_perf（全量请求）
+# warmup 阶段始终固定 default_perf（数据量太小无法形成稳态窗口），此处只控制全量阶段
+DEFAULT_PERFORMANCE_TEST = "stable_stage"
 
 # aisbench 输出保存路径（可被 --output_dir 覆盖）
 OUTPUT_DIR = "./outputs/default"

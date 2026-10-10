@@ -20,6 +20,18 @@ from vllm_pd_monitor import (
 )
 logging.getLogger().setLevel(logging.INFO)
 
+# warmup 阶段固定使用的统计口径：数据量仅 prefix_num*dp*2 条且 output_len=1，
+# 无法形成稳态窗口（stable_stage 会报 Can not find a stable stage 并中止），必须用全量口径
+WARMUP_SUMMARIZER = "default_perf"
+
+# main 块注入变量的模块级默认值（保证函数可独立调用/单测）
+test_accuracy = False
+enable_think = False
+api_test_type = "VLLMCustomAPIChatStream"
+api_test_abbr = "vllm-api-stream-chat"
+request_rate = "0"
+dp = 1
+
 
 def parse_arguments():
     parser = argparse.ArgumentParser()
@@ -96,11 +108,11 @@ def create_gsm8k_dataset(dataset_type, input_len, data_num, model_path, dataset_
             logging.info(f"Dataset {dataset_name} exist.")
     return prefix_jsonl_path, dataset_jsonl_path
 
-def generate_aisbench_command(DEFAULT_PERFORMANCE_TEST):
+def generate_aisbench_command(summarizer):
     if test_accuracy:
         ais_bench_cmd = f"ais_bench --models vllm_api_chat_temp --datasets gsm8k_gen_0_shot_cot_str_perf --work-dir {OUTPUT_DIR} --dump-eval-details"
     else:
-        ais_bench_cmd = f"ais_bench --models vllm_api_chat_temp --datasets gsm8k_gen_0_shot_cot_str_perf --mode perf --summarizer {DEFAULT_PERFORMANCE_TEST} --work-dir {OUTPUT_DIR} --debug --num-warmups 0 2>&1 | tee -a aisbench.log | tee -a aisbench_all.log"
+        ais_bench_cmd = f"ais_bench --models vllm_api_chat_temp --datasets gsm8k_gen_0_shot_cot_str_perf --mode perf --summarizer {summarizer} --work-dir {OUTPUT_DIR} --debug --num-warmups 0 2>&1 | tee -a aisbench.log | tee -a aisbench_all.log"
     return ais_bench_cmd
 
 def generate_test_dataset(src_file, dst_dir):
@@ -111,12 +123,13 @@ def generate_test_dataset(src_file, dst_dir):
     symlink_force(src_file, dst_file)
     return
 
-def save_result(request_rate, npu_num, extra_metrics=None):
+def save_result(request_rate, npu_num, extra_metrics=None, summarizer="default_perf"):
     aisbench_log_dir = "aisbench.log"
     filename = "aisbench_result.csv"
     ans, log_dir=get_data(aisbench_log_dir,request_rate,npu_num)
     if extra_metrics:
         ans.update(extra_metrics)
+    ans["summarizer"] = summarizer
     save_log(aisbench_log_dir, log_dir)
     save_csv(ans, filename)
 
@@ -425,9 +438,8 @@ if __name__ == '__main__':
         file.close()
         logging.info("train dataset created.")    
     
-    # 生成 aisbench 命令
-    ais_bench_cmd = generate_aisbench_command(DEFAULT_PERFORMANCE_TEST)
-    logging.info(f"test start, use command: {ais_bench_cmd}")
+    # summarizer 策略：warmup 阶段固定 default_perf（数据量过小无法形成稳态窗口），全量阶段用配置值
+    logging.info(f"summarizer strategy: warmup -> {WARMUP_SUMMARIZER} (fixed), full dataset -> {DEFAULT_PERFORMANCE_TEST} (config)")
 
     pd_monitor = PDMetricsMonitor.from_config()
     if pd_monitor.enabled:
@@ -444,13 +456,23 @@ if __name__ == '__main__':
         logging.info("runtime metrics monitor disabled (M_LISTEN_SERVER 与 P_LISTEN_SERVER/D_LISTEN_SERVER 均未配置)")
 
     def run_aisbench(cmd, phase):
+        logging.info(f"test start ({phase}), use command: {cmd}")
         if pd_monitor.enabled:
             pd_monitor.set_phase(phase)
             logging.info(f"runtime metrics phase -> {phase}")
             if is_full_dataset_phase(phase):
                 pd_monitor.capture_full_dataset_baseline()
                 logging.info("Captured full_dataset prefix-cache baseline (hits/queries), warmup excluded")
-        subprocess.run(cmd, shell=True, check=True)
+        try:
+            subprocess.run(cmd, shell=True, check=True)
+        except subprocess.CalledProcessError:
+            if "--summarizer stable_stage" in cmd:
+                logging.error(
+                    "[稳态测试失败] ais_bench 未找到稳态窗口（Can not find a stable stage），"
+                    "常见原因：数据量太小或并发未能两次打满。"
+                    "可增大 --data_num，或将 config.py 的 DEFAULT_PERFORMANCE_TEST 改为 default_perf。"
+                )
+            raise
         if pd_monitor.enabled:
             plot_dir = resolve_plot_output_dir(OUTPUT_DIR, api_test_abbr)
             plot_now = find_aisbench_plot_html(plot_dir)
@@ -487,15 +509,15 @@ if __name__ == '__main__':
                 # 命中率计算
                 query_tokens, query_tokens_external, hit_tokens, hit_tokens_external = get_pod_metrics_info(pod_info)
 
-                run_aisbench(ais_bench_cmd, "prefix_warmup")
+                run_aisbench(generate_aisbench_command(WARMUP_SUMMARIZER), "prefix_warmup")
                 logging.info(f"[完成] 前缀数据集测试完成，结果保存在aisbench_result.csv")
 
                 query_tokens_new, query_tokens_external_new, hit_tokens_new, hit_tokens_external_new = get_pod_metrics_info(pod_info)
                 cal_prefix_hit_info(query_tokens, query_tokens_external, hit_tokens, hit_tokens_external,query_tokens_new,
                                     query_tokens_external_new, hit_tokens_new, hit_tokens_external_new)
 
-                # 保存前缀测试结果
-                save_result(0, npu_num)
+                # 保存前缀测试结果（warmup 阶段固定 default_perf 口径；accuracy 模式如实标记）
+                save_result(0, npu_num, summarizer="accuracy" if test_accuracy else WARMUP_SUMMARIZER)
                 logging.info(f"[开始] 全量数据集测试")
                 # 命中率计算
                 query_tokens, query_tokens_external, hit_tokens, hit_tokens_external = get_pod_metrics_info(pod_info)
@@ -503,7 +525,7 @@ if __name__ == '__main__':
                 modify_aisbench_api(concurrency,str(output_len))
                 dst_file = generate_test_dataset(src_file_data, dst_dir)
                 # 执行测试命令
-                run_aisbench(ais_bench_cmd, "full_dataset")
+                run_aisbench(generate_aisbench_command(DEFAULT_PERFORMANCE_TEST), "full_dataset")
                 logging.info(f"[完成] 全量数据集测试完成，结果保存在aisbench_result.csv")
 
                 query_tokens_new, query_tokens_external_new, hit_tokens_new, hit_tokens_external_new = get_pod_metrics_info(pod_info)
@@ -514,7 +536,7 @@ if __name__ == '__main__':
                 logging.info(f"[开始] 全量数据集测试")
                 modify_aisbench_api(concurrency,str(output_len))
                 dst_file = generate_test_dataset(src_file_data, dst_dir)
-                run_aisbench(ais_bench_cmd, "full_dataset")
+                run_aisbench(generate_aisbench_command(DEFAULT_PERFORMANCE_TEST), "full_dataset")
                 logging.info(f"[完成] 全量数据集测试完成，结果保存在aisbench_result.csv")
 
         else:
@@ -524,17 +546,18 @@ if __name__ == '__main__':
             if test_times > 1:
                 for test_time in range(test_times):
                     logging.info(f"Execution rounds: {test_time + 1}")
-                    run_aisbench(ais_bench_cmd, f"full_dataset_round_{test_time + 1}")
+                    run_aisbench(generate_aisbench_command(DEFAULT_PERFORMANCE_TEST), f"full_dataset_round_{test_time + 1}")
             else:
-                run_aisbench(ais_bench_cmd, "full_dataset")
+                run_aisbench(generate_aisbench_command(DEFAULT_PERFORMANCE_TEST), "full_dataset")
             logging.info(f"[完成] 全量数据集测试完成，结果保存在aisbench_result.csv")
 
-        # 保存结果
+        # 保存结果（accuracy 模式无 perf summarizer，如实标记）
         extra_metrics = None
         if pd_monitor.enabled:
             extra_metrics = {"Prefix Hit Rate": pd_monitor.format_hit_rate_for_csv()}
             pd_monitor.print_hit_rate_table()
-        save_result(request_rate, npu_num, extra_metrics)
+        save_result(request_rate, npu_num, extra_metrics,
+                    summarizer="accuracy" if test_accuracy else DEFAULT_PERFORMANCE_TEST)
     finally:
         if pd_monitor.enabled:
             pd_monitor.stop()

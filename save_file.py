@@ -31,6 +31,7 @@ DEFAULT_METRICS = {
     "E2EL avg": 9999,
     "E2EL P90": 9999,
     "Prefix Hit Rate": "N/A",
+    "summarizer": "default_perf",
 }
 
 _METRIC_RULES = [

@@ -128,7 +128,22 @@ abc789   ← 前缀 abc
 ...
 ```
 
-## 7. 使用示例
+## 7. 性能统计口径（stable_stage / default_perf）
+
+config.py 的 `DEFAULT_PERFORMANCE_TEST` 控制 ais_bench 性能统计口径，**默认 `stable_stage`（稳态）**：
+
+| 口径 | 统计范围 | 适用场景 |
+| --- | --- | --- |
+| `stable_stage` | 仅"稳态窗口"内的请求（并发打满后第 2 个请求 → 最后一次并发峰值） | 排除爬坡/收尾干扰，看服务稳态能力 |
+| `default_perf` | 全部请求 | 全生命周期口径 |
+
+- **warmup 阶段固定用 `default_perf`**：warmup 仅 `prefix_num × 2 × dp` 条请求且 `output_len=1`，无法形成稳态窗口，若用 stable_stage 会报 `Can not find a stable stage` 中止测试
+- 两种口径的发压流程、输出文件完全一致，仅数值统计范围不同（`Benchmark Duration`/`Total Requests`/`Concurrency` 等在 stable_stage 下为窗口内口径）
+- **`aisbench_result.csv` 的 `summarizer` 列**记录每行数据的统计口径，跨口径数据不可直接对比
+- 稳态窗口判定失败（数据量太小、并发未两次打满）时测试中止并输出诊断日志；可增大 `--data_num`，或改回 `default_perf`
+- 版本注意：ais-bench-benchmark 的稳态算法 2026-08 有大改（窗口判定更鲁棒），PyPI `3.1.20260630` 为旧算法，新旧版本稳态数值不可比；`pip show ais-bench-benchmark` 确认版本
+
+## 8. 使用示例
 
 ```bash
 # 1. 普通性能测试
@@ -155,7 +170,7 @@ python3 aisbench_test.py --dataset "/mnt/data/medium.jsonl" --output_len 20 --co
 python3 aisbench_test.py --dataset "/mnt/data/gsm8k.jsonl" --output_len 1024 --concurrency 64 --request_rate 4 --test_accuracy
 ```
 
-## 8. 运行时指标监控
+## 9. 运行时指标监控
 
 配置 `*_LISTEN_SERVER` 后，测试结束自动生成：
 
@@ -172,16 +187,16 @@ outputs/<目录>/<时间戳>/performances/vllm-api-stream-chat/vllm_pd_runtime_m
 
 所有时间轴图表联动缩放，底部附参数配置表。
 
-## 9. 结果获取
+## 10. 结果获取
 
 | 产物 | 位置 |
 | --- | --- |
-| 性能结果 | `aisbench_result.csv` |
+| 性能结果 | `aisbench_result.csv`（`summarizer` 列标记统计口径） |
 | 当次日志 | `aisbench.log`（历史：`aisbench_all.log`、`outputs/<目录>/<时间戳>/`） |
 | 命中率 | 打屏日志 + `aisbench_result.csv` + HTML 标题 |
 | 运行时指标 | 上文 HTML 路径 |
 
-## 10. FAQ
+## 11. FAQ
 
 **1. 报错"生成数据集失败，请清空 picked ids"**：删除 `picked_ids.txt`。
 
@@ -193,10 +208,12 @@ outputs/<目录>/<时间戳>/performances/vllm-api-stream-chat/vllm_pd_runtime_m
 
 **5. tokenizer 加载失败**：检查 transformers 版本与模型适配性，部分模型需 `trust_remote_code=True`。
 
-## 11. License
+**6. 报错 "Can not find a stable stage"**：稳态统计未找到稳态窗口（数据量太小或并发未两次打满）。增大 `--data_num`，或将 config.py 的 `DEFAULT_PERFORMANCE_TEST` 改为 `default_perf`。
+
+## 12. License
 
 见 [LICENSE](LICENSE)。
 
-## 12. 致谢
+## 13. 致谢
 
 本项目参考了 [rayn-zzz/aisbench_auto_tools_prefix](https://github.com/rayn-zzz/aisbench_auto_tools_prefix) 项目的部分内容，并在此基础上重新设计开发，感谢原作者的工作。
