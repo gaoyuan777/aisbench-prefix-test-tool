@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """vLLM 运行时指标采集：支持 PD 分离（P/D）与混部（M_LISTEN_SERVER），实时文件监控与 HTML 汇总。"""
 
 from __future__ import annotations
@@ -29,6 +29,13 @@ try:
     import tabulate
 except ImportError:  # pragma: no cover
     tabulate = None
+
+try:
+    from kv_stage_analyzer import STAGE_COLORS, STAGE_KEYS, STAGE_LABELS
+except ImportError:  # pragma: no cover
+    STAGE_KEYS = ()
+    STAGE_LABELS = {}
+    STAGE_COLORS = {}
 
 
 POLL_INTERVAL_SEC = 1.0
@@ -659,6 +666,7 @@ class PDMetricsMonitor:
         self.started_at: Optional[datetime] = None
         self.stopped_at: Optional[datetime] = None
         self._aisbench_plots: List[Dict[str, Any]] = []
+        self._kv_stage_data: Optional[Dict[str, Any]] = None
 
     @classmethod
     def from_config(cls) -> "PDMetricsMonitor":
@@ -677,6 +685,10 @@ class PDMetricsMonitor:
                 self._full_baseline = {}
                 self._baseline_ts = None
                 self._end_ts = None
+
+    def set_kv_stage_data(self, data: Optional[Dict[str, Any]]) -> None:
+        """注入 KVStageAnalyzer.build_bar_traces() 的结果，export 时生成图 11。"""
+        self._kv_stage_data = data
 
     def remember_aisbench_plot(self, path: Optional[str], label: str = "") -> None:
         """ais_bench 每一阶段结束后立刻记下 gsm8k_plot，避免全量跑完后只剩最后一次。"""
@@ -913,6 +925,7 @@ class PDMetricsMonitor:
             hit_rate_summary=hit_rate_summary,
             aisbench_log_path="aisbench.log",
             mode=self.mode,
+            kv_stage_data=self._kv_stage_data,
         )
         append_hit_rate_to_aisbench_json(output_dir, hit_rate_summary)
         del run_tag
@@ -1584,6 +1597,29 @@ def _legend_style(x: float, y: float, xanchor: str, yanchor: str) -> dict:
     )
 
 
+def _legend_below_subplot(fig, xaxis_key: str, yaxis_key: str) -> dict:
+    """图例水平挂在子图正下方（图外，不挡数据也不挡相邻图）。
+
+    悬浮于子图 domain 底边之下的行间隙中；水平排布只占一行高度，
+    与下一行的子图标题（位于间隙上部）错开。
+    """
+    x0 = list(fig.layout[xaxis_key].domain or [0, 1])[0]
+    y0 = list(fig.layout[yaxis_key].domain or [0, 1])[0]
+    return dict(
+        x=x0,
+        y=y0 - 0.006,
+        xanchor="left",
+        yanchor="top",
+        bgcolor="rgba(255,255,255,0)",
+        borderwidth=0,
+        font=dict(size=9),
+        itemsizing="constant",
+        itemwidth=30,
+        tracegroupgap=2,
+        orientation="h",
+    )
+
+
 def _adaptive_legend_box(fig, xaxis_key: str, yaxis_key: str, ys: List[Any], prefer: str = "topright") -> dict:
     domain_x = list(fig.layout[xaxis_key].domain or [0, 1])
     domain_y = list(fig.layout[yaxis_key].domain or [0, 1])
@@ -1681,7 +1717,7 @@ def _add_kv_lines(fig, samples: List[Dict[str, Any]], row: int, col: int, legend
             col=col,
         )
     fig.update_yaxes(title_text="KV Cache 占用率（%）", **AXIS_CONFIG, rangemode="tozero", row=row, col=col)
-    fig.update_xaxes(title_text="时间", type="date", tickformat="%H:%M:%S", **AXIS_CONFIG, row=row, col=col)
+    fig.update_xaxes(type="date", tickformat="%H:%M:%S", **AXIS_CONFIG, row=row, col=col)
 
 
 def _add_queue_bars(fig, samples: List[Dict[str, Any]], role: str, row: int, col: int, legend: str) -> None:
@@ -1814,7 +1850,7 @@ def _add_kv_lines_per_engine(fig, samples: List[Dict[str, Any]], row: int, col: 
             col=col,
         )
     fig.update_yaxes(title_text="KV Cache 占用率（%）", **AXIS_CONFIG, rangemode="tozero", row=row, col=col)
-    fig.update_xaxes(title_text="时间", type="date", tickformat="%H:%M:%S", **AXIS_CONFIG, row=row, col=col)
+    fig.update_xaxes(type="date", tickformat="%H:%M:%S", **AXIS_CONFIG, row=row, col=col)
 
 
 def _add_queue_bars_per_engine(fig, samples: List[Dict[str, Any]], role: str, row: int, col: int, legend: str) -> None:
@@ -1900,6 +1936,101 @@ def _add_queue_bars_per_engine(fig, samples: List[Dict[str, Any]], role: str, ro
     fig.update_yaxes(title_text="各 DP 队列请求数", **AXIS_CONFIG, rangemode="tozero", row=row, col=col)
     fig.update_xaxes(title_text="时间（每1秒一组）", type="date", tickformat="%H:%M:%S", **AXIS_CONFIG, row=row, col=col)
 
+def _add_kv_stage_bars(fig, kv_stage_data: Dict[str, Any], row: int, col: int, legend: str = "legend3") -> None:
+    """图 3：请求五阶段水平分段时间线（绝对时间轴，与全图联动框选）。
+
+    Y 轴 = 连续正数编号（1 起，同图 1 风格），刻度 plotly autotick 自动分格。
+    plotly 水平图例的 item 从右往左按 trace 顺序渲染，因此按目标顺序倒序添加 trace，
+    使渲染后图例从左到右为：P 执行、P 等待、KV 拉取、D 执行、D 等待。
+    avg 汇总为两行 HTML 表格 annotation，挂在图例正下方（左对齐）。不设 legendgroup。
+    """
+    y_labels = kv_stage_data.get("y") or []
+    if not y_labels:
+        return
+    stages = kv_stage_data.get("stages") or {}
+    summary = (kv_stage_data.get("summary") or {}).get("stages") or {}
+    # 语义顺序（请求生命周期）：P 等待 → P 执行 → KV 拉取 → D 等待 → D 执行；
+    # plotly 水平图例的 item 从右往左按 trace 顺序渲染，故添加顺序取其倒序
+    legend_order = ["d_running", "d_waiting", "kv_transfer", "p_running", "p_waiting"]
+    for key in legend_order:
+        stage = stages.get(key)
+        if not stage:
+            continue
+        fig.add_trace(
+            go.Bar(
+                y=y_labels,
+                # date 轴内部单位为毫秒：宽度（秒）×1000
+                x=[w * 1000.0 for w in stage["width"]],
+                base=stage["base"],
+                orientation="h",
+                name=STAGE_LABELS.get(key, key),
+                marker=dict(color=STAGE_COLORS.get(key, "#7f7f7f")),
+                hovertext=stage["text"],
+                hoverinfo="text",
+                showlegend=True,
+                legend=legend,
+            ),
+            row=row,
+            col=col,
+        )
+    # avg 汇总两行表格：HTML <table> 保证列对齐，"avg(s)" 放左下角占位不挤占数值列；
+    # 位置在图例正下方（图例 y0-0.006、高约 0.01，表格再往下），与图例左对齐
+    display_order = ["p_waiting", "p_running", "kv_transfer", "d_waiting", "d_running"]
+    heads, vals = [], []
+    for key in display_order:
+        stage = summary.get(key)
+        if not stage:
+            continue
+        heads.append(STAGE_LABELS.get(key, key))
+        vals.append(f"{stage['avg']:.3f}")
+    if heads:
+        # 从刚添加的 bar trace 反查本子图 axis key（tr.xaxis 形如 "x3"），规避 colspan 编号陷阱
+        last_trace = fig.data[-1]
+        xaxis_key = "xaxis" if last_trace.xaxis in (None, "x") else f"xaxis{last_trace.xaxis[1:]}"
+        yaxis_key = "yaxis" if last_trace.yaxis in (None, "y") else f"yaxis{last_trace.yaxis[1:]}"
+        x0 = list(fig.layout[xaxis_key].domain or [0, 1])[0]
+        y0 = list(fig.layout[yaxis_key].domain or [0, 1])[0]
+        # 单行 avg 汇总文本（不依赖等宽字体/表格对齐）：单位在最前，五阶段名 + 平均值逐项列出
+        pairs = [f"{h} {v}" for h, v in zip(heads, vals)]
+        text = "avg(s)：" + "，".join(pairs)
+        fig.add_annotation(
+            text=text,
+            xref="paper", yref="paper",
+            x=x0, y=y0 - 0.020, xanchor="left", yanchor="top",
+            showarrow=False,
+            align="left",
+            font=dict(size=10, color="#333333"),
+        )
+    # 照搬图 1：warmup 与 full 各自从 1 起编号、共用同一根轴；warmup bar 半透明区分
+    # （图 1 的 warmup trace 为虚线，bar 无线型故用透明度），不占图例位，hover 标 [warmup]
+    warmup_y = kv_stage_data.get("warmup_y") or []
+    warmup_stages = kv_stage_data.get("warmup_stages") or {}
+    if warmup_y:
+        for key in legend_order:
+            stage = warmup_stages.get(key)
+            if not stage:
+                continue
+            fig.add_trace(
+                go.Bar(
+                    y=warmup_y,
+                    x=[w * 1000.0 for w in stage["width"]],
+                    base=stage["base"],
+                    orientation="h",
+                    name=STAGE_LABELS.get(key, key),
+                    marker=dict(color=STAGE_COLORS.get(key, "#7f7f7f"), opacity=0.45),
+                    hovertext=stage["text"],
+                    hoverinfo="text",
+                    showlegend=False,
+                    legend=legend,
+                ),
+                row=row,
+                col=col,
+            )
+    # 与全图共用主时间轴（框选任意图联动）+ 相同刻度格式；matches 由外层统一设置，此处双保险
+    fig.update_xaxes(type="date", matches="x", tickformat="%H:%M:%S", **AXIS_CONFIG, row=row, col=col)
+    fig.update_yaxes(title_text="Request Index", **AXIS_CONFIG, row=row, col=col)
+
+
 def _add_phase_bands(fig, phases: List[Dict[str, str]], stopped_at: Optional[datetime], cells: List[Tuple[int, int]]) -> None:
     phase_colors = ["rgba(31,119,180,0.08)", "rgba(255,127,14,0.08)", "rgba(44,160,44,0.08)"]
     for idx, phase in enumerate(phases):
@@ -1968,6 +2099,7 @@ def write_metrics_html(
     hit_rate_summary: Optional[List[Dict[str, Any]]] = None,
     aisbench_log_path: str = "aisbench.log",
     mode: str = "pd",
+    kv_stage_data: Optional[Dict[str, Any]] = None,
 ) -> None:
     if go is None or make_subplots is None:
         with open(output_path, "w", encoding="utf-8") as fh:
@@ -1994,26 +2126,56 @@ def write_metrics_html(
         table_row = 4
         table_col = 1
     else:
-        n_rows = 5
-        table_row = 5
-        table_col = 2
-        titles = [
-            "图1 请求时间轴（来自 gsm8k_plot）",
-            "图2 KV Cache 占用率随时间变化",
-            "图3 请求并发数（来自 gsm8k_plot）",
-            "图4 P 节点 Running/Waiting/Preempted 队列（每1秒）",
-            "图5 P 节点各 DP KV Cache 占用率",
-            "图6 D 节点 Running/Waiting/Preempted 队列（每1秒）",
-            "图7 P 节点各 DP Running/Waiting 队列",
-            "图8 D 节点各 DP KV Cache 占用率",
-            "图9 D 节点各 DP Running/Waiting 队列",
-            "图10 ais_bench 测试结果",
-        ]
-        specs = [[{}, {}], [{}, {}], [{}, {}], [{}, {}], [{}, {"type": "table"}]]
-        cartesian_cells = ((1, 1), (1, 2), (2, 1), (2, 2), (3, 1), (3, 2), (4, 1), (4, 2), (5, 1))
-        legend_keys = ["legend", "legend2", "legend3", "legend4", "legend5", "legend6", "legend7", "legend8", "legend9"]
-        prefers = ["topright", "topleft", "topright", "topright", "topright", "topright", "topright", "topright", "topright"]
+        has_kv_stage = bool(kv_stage_data)
         page_title = "vLLM PD 分离运行时指标与 ais_bench 请求图"
+        if has_kv_stage:
+            # 新布局：图 11（五阶段时间线）提到图 3 位置；图 5 起左 P 右 D；结果表整行
+            n_rows = 6
+            table_row = 6
+            table_col = 1
+            kv_sample_note = ""
+            if kv_stage_data.get("sampled"):
+                kv_sample_note = f"（显示 {len(kv_stage_data.get('y', []))}/{kv_stage_data.get('total', 0)}，均匀采样）"
+            titles = [
+                "图1 请求时间轴（来自 gsm8k_plot）",
+                "图2 KV Cache 占用率随时间变化",
+                f"图3 请求五阶段耗时构成：P 等待 / P 执行 / KV 拉取 / D 等待 / D 执行{kv_sample_note}",
+                "图4 请求并发数（来自 gsm8k_plot）",
+                "图5 P 节点 Running/Waiting/Preempted 队列（每1秒）",
+                "图6 D 节点 Running/Waiting/Preempted 队列（每1秒）",
+                "图7 P 节点各 DP KV Cache 占用率",
+                "图8 D 节点各 DP KV Cache 占用率",
+                "图9 P 节点各 DP Running/Waiting 队列",
+                "图10 D 节点各 DP Running/Waiting 队列",
+                "图11 ais_bench 测试结果",
+            ]
+            specs = [[{}, {}], [{}, {}], [{}, {}], [{}, {}], [{}, {}],
+                     [{"type": "table", "colspan": 2}, None]]
+            cartesian_cells = ((1, 1), (1, 2), (2, 1), (2, 2), (3, 1), (3, 2), (4, 1), (4, 2), (5, 1), (5, 2))
+            legend_keys = ["legend", "legend2", "legend3", "legend4", "legend5",
+                           "legend6", "legend7", "legend8", "legend9", "legend10"]
+            prefers = ["topright", "topleft", "topright", "topleft", "topright",
+                       "topright", "topright", "topright", "topright", "topright"]
+        else:
+            n_rows = 5
+            table_row = 5
+            table_col = 2
+            titles = [
+                "图1 请求时间轴（来自 gsm8k_plot）",
+                "图2 KV Cache 占用率随时间变化",
+                "图3 请求并发数（来自 gsm8k_plot）",
+                "图4 P 节点 Running/Waiting/Preempted 队列（每1秒）",
+                "图5 P 节点各 DP KV Cache 占用率",
+                "图6 D 节点 Running/Waiting/Preempted 队列（每1秒）",
+                "图7 P 节点各 DP Running/Waiting 队列",
+                "图8 D 节点各 DP KV Cache 占用率",
+                "图9 D 节点各 DP Running/Waiting 队列",
+                "图10 ais_bench 测试结果",
+            ]
+            specs = [[{}, {}], [{}, {}], [{}, {}], [{}, {}], [{}, {"type": "table"}]]
+            cartesian_cells = ((1, 1), (1, 2), (2, 1), (2, 2), (3, 1), (3, 2), (4, 1), (4, 2), (5, 1))
+            legend_keys = ["legend", "legend2", "legend3", "legend4", "legend5", "legend6", "legend7", "legend8", "legend9"]
+            prefers = ["topright", "topleft", "topright", "topright", "topright", "topright", "topright", "topright", "topright"]
 
     fig = make_subplots(
         rows=n_rows,
@@ -2025,6 +2187,10 @@ def write_metrics_html(
     )
 
     origin = infer_plot_origin(samples, phases, started_at, aisbench_log_path, aisbench_plot_path)
+    # 并发数图位置：PD 启用五阶段分析时在 (2,2)/legend4，否则原图 3 位置 (2,1)/legend3
+    kv_layout = (not colocated) and bool(kv_stage_data)
+    conc_row, conc_col = (2, 2) if kv_layout else (2, 1)
+    conc_legend = "legend4" if kv_layout else "legend3"
     plot_layout = {}
     plot_specs = [dict(item) for item in (aisbench_plots or []) if item.get("path") and os.path.exists(item["path"])]
     if not plot_specs and aisbench_plot_path and os.path.exists(aisbench_plot_path):
@@ -2049,7 +2215,7 @@ def write_metrics_html(
             prefix = f"{label} " if multi_plot and label else ""
             dash = "dot" if multi_plot and spec_idx < len(plot_specs) - 1 else None
             _attach_copied_traces(fig, first_traces, 1, 1, "legend", rec_origin, prefix, dash)
-            _attach_copied_traces(fig, second_traces, 2, 1, "legend3", rec_origin, prefix, dash)
+            _attach_copied_traces(fig, second_traces, conc_row, conc_col, conc_legend, rec_origin, prefix, dash)
             logging.info(
                 "embedded gsm8k_plot traces: label=%s timeline=%s concurrency=%s from %s",
                 label or "-",
@@ -2065,15 +2231,24 @@ def write_metrics_html(
         y1_title = "Request Index"
     y3_title = _layout_axis_title(plot_layout, "yaxis2", "Request Concurrency Count")
     fig.update_yaxes(title_text=y1_title, **AXIS_CONFIG, row=1, col=1)
-    fig.update_yaxes(title_text=y3_title, **AXIS_CONFIG, row=2, col=1)
-    fig.update_xaxes(title_text="时间", type="date", tickformat="%H:%M:%S", **AXIS_CONFIG, row=1, col=1)
-    fig.update_xaxes(title_text="时间", type="date", tickformat="%H:%M:%S", **AXIS_CONFIG, row=2, col=1)
+    fig.update_yaxes(title_text=y3_title, **AXIS_CONFIG, row=conc_row, col=conc_col)
+    fig.update_xaxes(type="date", tickformat="%H:%M:%S", **AXIS_CONFIG, row=1, col=1)
+    fig.update_xaxes(type="date", tickformat="%H:%M:%S", **AXIS_CONFIG, row=conc_row, col=conc_col)
 
     _add_kv_lines(fig, samples, row=1, col=2, legend="legend2")
     if colocated:
         _add_queue_bars(fig, samples, role="M", row=2, col=2, legend="legend4")
         _add_kv_lines_per_engine(fig, samples, row=3, col=1, legend="legend5", role="M")
         _add_queue_bars_per_engine(fig, samples, role="M", row=3, col=2, legend="legend6")
+    elif has_kv_stage:
+        # 新布局：左 P 右 D 成对排列（行3 队列、行4 KV、行5 队列明细）
+        _add_kv_stage_bars(fig, kv_stage_data, row=2, col=1, legend="legend3")
+        _add_queue_bars(fig, samples, role="P", row=3, col=1, legend="legend5")
+        _add_queue_bars(fig, samples, role="D", row=3, col=2, legend="legend6")
+        _add_kv_lines_per_engine(fig, samples, row=4, col=1, legend="legend7", role="P")
+        _add_kv_lines_per_engine(fig, samples, row=4, col=2, legend="legend8", role="D")
+        _add_queue_bars_per_engine(fig, samples, role="P", row=5, col=1, legend="legend9")
+        _add_queue_bars_per_engine(fig, samples, role="D", row=5, col=2, legend="legend10")
     else:
         _add_queue_bars(fig, samples, role="P", row=2, col=2, legend="legend4")
         _add_queue_bars(fig, samples, role="D", row=3, col=2, legend="legend6")
@@ -2103,7 +2278,7 @@ def write_metrics_html(
                 continue
             if str(getattr(trace, "xaxis", "x") or "x") == short_x and getattr(trace, "y", None) is not None:
                 ys.extend(list(trace.y))
-        legend_layout[legend_key] = _adaptive_legend_box(fig, xk, yk, ys, prefer)
+        legend_layout[legend_key] = _legend_below_subplot(fig, xk, yk)
 
     hit_line = format_hit_rate_parenthetical(hit_rate_summary)
     fig.update_layout(
@@ -2116,7 +2291,7 @@ def write_metrics_html(
             xanchor="center",
             font=dict(size=22, color="#1a1a1a"),
         ),
-        height=1950 if colocated else 2400,
+        height=1950 if colocated else (2880 if kv_stage_data else 2400),
         width=1680,
         plot_bgcolor="white",
         paper_bgcolor="white",
