@@ -183,7 +183,9 @@ outputs/<目录>/<时间戳>/performances/vllm-api-stream-chat/vllm_pd_runtime_m
 
 **混部布局（7 图）**：请求时间轴 / KV 占用率（聚合平均）/ 并发数 / 队列柱状图 / 各 DP KV / 各 DP 队列 / 结果表
 
-**PD 分离布局（10 图）**：请求时间轴 / KV 占用率（**P/D 各一条平均线**）/ 并发数 / P 队列 / P 各 DP KV / D 队列 / P 各 DP 队列 / D 各 DP KV / D 各 DP 队列 / 结果表
+**PD 分离布局（默认 10 图）**：请求时间轴 / KV 占用率（**P/D 各一条平均线**）/ 并发数 / P 队列 / P 各 DP KV / D 队列 / P 各 DP 队列 / D 各 DP KV / D 各 DP 队列 / 结果表
+
+配置 `KV_STAGE_LOG_P/D`（P/D 节点 vllm 日志路径，需 vllm 侧已合入 REQ_STAGE_METRIC/KV_XFER_METRIC 上报）后布局调整为 **11 图 6 行**（行 3 起左 P 右 D 成对）：请求时间轴 / KV 占用率 / **图 3「请求五阶段耗时构成」**（水平分段时间线，绝对时间轴与全图联动框选；全量请求与图 1 同号 1..N，warmup 半透明叠加独立编号） / 并发数 / P 队列 / D 队列 / P 各 DP KV / D 各 DP KV / P 各 DP 队列 / D 各 DP 队列 / 结果表（整行）。阶段顺序 P 等待 → P 执行 → KV 拉取 → D 等待 → D 执行；hover 展示 KV 等待分解（纯传输 vs 建连+排队+失败超时）、worker 传输明细与 P→KV 间隙；图例下方附 avg 汇总行。`aisbench_result.csv` 追加 5 列阶段均值，请求明细另存 `kv_stage_details.csv`（含 warmup）。与命中率同口径：仅统计全量阶段（warmup 排除，基于日志 offset 增量采集；日志行内含 `ts_ms` 毫秒打点时优先采用，锚点精度毫秒级）。
 
 所有时间轴图表联动缩放，底部附参数配置表。
 
@@ -195,6 +197,7 @@ outputs/<目录>/<时间戳>/performances/vllm-api-stream-chat/vllm_pd_runtime_m
 | 当次日志 | `aisbench.log`（历史：`aisbench_all.log`、`outputs/<目录>/<时间戳>/`） |
 | 命中率 | 打屏日志 + `aisbench_result.csv` + HTML 标题 |
 | 运行时指标 | 上文 HTML 路径 |
+| 五阶段耗时（可选） | HTML 图 3 + `aisbench_result.csv` 5 列均值 + `kv_stage_details.csv` 请求明细 |
 
 ## 11. FAQ
 
@@ -209,6 +212,8 @@ outputs/<目录>/<时间戳>/performances/vllm-api-stream-chat/vllm_pd_runtime_m
 **5. tokenizer 加载失败**：检查 transformers 版本与模型适配性，部分模型需 `trust_remote_code=True`。
 
 **6. 报错 "Can not find a stable stage"**：稳态统计未找到稳态窗口（数据量太小或并发未两次打满）。增大 `--data_num`，或将 config.py 的 `DEFAULT_PERFORMANCE_TEST` 改为 `default_perf`。
+
+**7. 五阶段图不生成**：检查 `KV_STAGE_LOG_P/D` 是否填写且日志文件存在（容器内路径）；确认 vllm 侧已合入 REQ_STAGE_METRIC 上报（`grep REQ_STAGE_METRIC vllm_p.log` 有输出）；仅 PD 分离形态支持；`*_LISTEN_SERVER` 未配置时 HTML 不生成（此时仅有打屏汇总与 CSV）。
 
 ## 12. License
 
