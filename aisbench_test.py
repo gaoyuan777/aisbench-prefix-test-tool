@@ -10,6 +10,7 @@ from config import *
 from generate_dataset import *
 from save_file import get_data, save_csv, save_log
 from cal_prefix_hit_rate import *
+from kv_stage_analyzer import KVStageAnalyzer
 from vllm_pd_monitor import (
     PDMetricsMonitor,
     is_full_dataset_phase,
@@ -455,6 +456,14 @@ if __name__ == '__main__':
     else:
         logging.info("runtime metrics monitor disabled (M_LISTEN_SERVER 与 P_LISTEN_SERVER/D_LISTEN_SERVER 均未配置)")
 
+    # PD 请求五阶段耗时分析（KV_STAGE_LOG_P/D 配置后启用；仅 PD 分离形态）
+    kv_analyzer = KVStageAnalyzer.from_config()
+    if kv_analyzer.enabled and pd_monitor.enabled and pd_monitor.mode == "colocated":
+        logging.warning("[kv_stage] 混部形态不支持五阶段分析，已忽略 KV_STAGE_LOG_P/D 配置")
+        kv_analyzer.enabled = False
+    if kv_analyzer.enabled and not pd_monitor.enabled:
+        logging.warning("[kv_stage] 运行时监控未启用（*_LISTEN_SERVER 未配置），五阶段结果仅输出打屏与 CSV，不生成图 11")
+
     def run_aisbench(cmd, phase):
         logging.info(f"test start ({phase}), use command: {cmd}")
         if pd_monitor.enabled:
@@ -463,6 +472,8 @@ if __name__ == '__main__':
             if is_full_dataset_phase(phase):
                 pd_monitor.capture_full_dataset_baseline()
                 logging.info("Captured full_dataset prefix-cache baseline (hits/queries), warmup excluded")
+        if kv_analyzer.enabled:
+            kv_analyzer.start()
         try:
             subprocess.run(cmd, shell=True, check=True)
         except subprocess.CalledProcessError:
@@ -489,6 +500,8 @@ if __name__ == '__main__':
                     f"Δqueries={item.get('prefix_cache_queries_delta')} "
                     f"rate={rate_text}"
                 )
+        if kv_analyzer.enabled:
+            kv_analyzer.collect(phase)
 
     try:
         # 执行命令
@@ -556,6 +569,18 @@ if __name__ == '__main__':
         if pd_monitor.enabled:
             extra_metrics = {"Prefix Hit Rate": pd_monitor.format_hit_rate_for_csv()}
             pd_monitor.print_hit_rate_table()
+        if kv_analyzer.enabled and kv_analyzer.records:
+            kv_analyzer.log_summary()
+            kv_metrics = kv_analyzer.csv_extra_metrics()
+            if extra_metrics:
+                extra_metrics.update(kv_metrics)
+            else:
+                extra_metrics = kv_metrics
+            kv_perf_dir = resolve_plot_output_dir(OUTPUT_DIR, api_test_abbr)
+            kv_analyzer.align_with_aisbench_details(kv_perf_dir)
+            kv_analyzer.write_details_csv(kv_perf_dir)
+            if pd_monitor.enabled:
+                pd_monitor.set_kv_stage_data(kv_analyzer.build_bar_traces())
         save_result(request_rate, npu_num, extra_metrics,
                     summarizer="accuracy" if test_accuracy else DEFAULT_PERFORMANCE_TEST)
     finally:

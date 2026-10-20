@@ -28,6 +28,13 @@ DEFAULT_PERFORMANCE_TEST = "stable_stage"
 # aisbench 输出保存路径（可被 --output_dir 覆盖）
 OUTPUT_DIR = "./outputs/default"
 
+# PD 请求五阶段耗时分析（可选）：
+#   vllm 侧需已合入 REQ_STAGE_METRIC / KV_XFER_METRIC 上报（见配套开发指南）
+#   P/D 节点 vllm 日志文件路径；留空 "" 则不启用（不生成图 11，其余功能不受影响）
+#   单机部署（P/D 同容器）两路径均填本机路径；跨机部署 D 侧日志需挂载/拷贝到本机可访问路径
+KV_STAGE_LOG_P = ""   # 例: "/workspace/pd/vllm_p.log"
+KV_STAGE_LOG_D = ""   # 例: "/workspace/pd/vllm_d.log"
+
 # --prefix_test 各 DP 域命中率查询地址：
 #   prefix cache 命中发生在 P（Prefill）节点，注意是 vLLM 引擎端口，不是 proxy 端口
 #   格式 ["{ip}:{port}", ...]，留空 [] 则默认 HOST_IP:HOST_PORT（PD 形态下通常不正确，务必填写）
