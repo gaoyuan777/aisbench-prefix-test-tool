@@ -47,51 +47,6 @@ PROGRESS_BAR_RE = re.compile(
 )
 SKIP_RESULT_KEYS = {"Prefix Cache Hit Rate", "Prefix Hit Rate", "prefix cache hit rate"}
 CARTESIAN_CELLS = ((1, 1), (1, 2), (2, 1), (2, 2), (3, 2))
-RELAYOUT_SYNC_JS = """
-(function() {
-  var gd = document.getElementById('{plot_id}');
-  if (!gd) return;
-  var syncing = false;
-  function cartesianXAxes() {
-    return Object.keys(gd.layout || {}).filter(function(k) {
-      if (!/^xaxis[0-9]*$/.test(k)) return false;
-      var ax = gd.layout[k];
-      return ax && ax.visible !== false && Array.isArray(ax.domain);
-    });
-  }
-  gd.on('plotly_relayout', function(ev) {
-    if (syncing || !ev) return;
-    var axes = cartesianXAxes();
-    var changed = null;
-    for (var i = 0; i < axes.length; i++) {
-      var ax = axes[i];
-      if (ev[ax + '.range[0]'] !== undefined || ev[ax + '.range[1]'] !== undefined
-          || ev[ax + '.range'] !== undefined || ev[ax + '.autorange'] !== undefined) {
-        changed = ax;
-        break;
-      }
-    }
-    if (!changed) return;
-    var src = gd.layout[changed];
-    if (!src) return;
-    var update = {};
-    for (var j = 0; j < axes.length; j++) {
-      var tgt = axes[j];
-      if (tgt === changed) continue;
-      if (src.autorange) {
-        update[tgt + '.autorange'] = true;
-      } else if (src.range) {
-        update[tgt + '.range'] = src.range.slice();
-        update[tgt + '.autorange'] = false;
-      }
-    }
-    if (!Object.keys(update).length) return;
-    syncing = true;
-    Plotly.relayout(gd, update).then(function() { syncing = false; }, function() { syncing = false; });
-  });
-})();
-"""
-
 USAGE_METRICS = (
     "vllm:kv_cache_usage_perc",
     "vllm:gpu_cache_usage_perc",
@@ -112,10 +67,6 @@ QUERIES_METRICS = (
 RUNNING_METRICS = ("vllm:num_requests_running",)
 WAITING_METRICS = ("vllm:num_requests_waiting",)
 SWAPPED_METRICS = ("vllm:num_requests_swapped",)
-PREEMPT_METRICS = (
-    "vllm:num_preemptions",
-    "vllm:num_preemptions_total",
-)
 CACHE_INFO_METRICS = ("vllm:cache_config_info",)
 BLOCK_COUNT_LABELS = (
     "num_gpu_blocks",
@@ -179,8 +130,7 @@ EMPTY_METRICS = {
     "num_running": None,
     "num_waiting": None,
     "num_swapped": None,
-    "num_preemptions_total": None,
-    "num_gpu_blocks": None,
+        "num_gpu_blocks": None,
     "engines": {},
 }
 
@@ -327,19 +277,6 @@ def extract_runtime_metrics(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
     running_items = _pick_metric(samples, RUNNING_METRICS)
     waiting_items = _pick_metric(samples, WAITING_METRICS)
     swapped_items = _pick_metric(samples, SWAPPED_METRICS)
-    preempt_items = []
-    for name in PREEMPT_METRICS:
-        preempt_items = _pick_metric(samples, (name,))
-        if preempt_items:
-            break
-    if not preempt_items:
-        preempt_items = [
-            item for item in samples
-            if "preempt" in item["name"].lower()
-            and "bucket" not in item["name"].lower()
-            and not item["name"].endswith("_sum")
-            and not item["name"].endswith("_count")
-        ]
     info_items = _pick_metric(samples, CACHE_INFO_METRICS)
     direct_block_items = _pick_metric(samples, DIRECT_BLOCK_METRICS)
 
@@ -369,8 +306,7 @@ def extract_runtime_metrics(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
     running_by_engine = {_engine_id(item["labels"]): item["value"] for item in running_items}
     waiting_by_engine = {_engine_id(item["labels"]): item["value"] for item in waiting_items}
     swapped_by_engine = {_engine_id(item["labels"]): item["value"] for item in swapped_items}
-    preempt_by_engine = {_engine_id(item["labels"]): item["value"] for item in preempt_items}
-
+    
     usage_pct = _to_usage_percent(list(usage_by_engine.values()))
 
     free_blocks = None
@@ -397,7 +333,6 @@ def extract_runtime_metrics(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
         "num_running": sum(running_by_engine.values()) if running_by_engine else None,
         "num_waiting": sum(waiting_by_engine.values()) if waiting_by_engine else None,
         "num_swapped": sum(swapped_by_engine.values()) if swapped_by_engine else None,
-        "num_preemptions_total": sum(preempt_by_engine.values()) if preempt_by_engine else None,
         "num_gpu_blocks": total_blocks,
         "engines": {
             engine: {
@@ -527,7 +462,6 @@ def render_live_text(
         "Running",
         "Waiting",
         "Swapped",
-        "Preempts",
         "Status",
     ]
     runtime_rows = []
@@ -551,7 +485,6 @@ def render_live_text(
                 _fmt_int(item.get("num_running")),
                 _fmt_int(item.get("num_waiting")),
                 _fmt_int(item.get("num_swapped")),
-                _fmt_int(item.get("num_preemptions_total")),
                 item.get("error") or "ok",
             ]
         )
@@ -944,10 +877,8 @@ def _to_dt(text: Optional[str]) -> Optional[datetime]:
 
 
 BIN_SEC = 1.0
-QUEUE_BAR_WIDTH_MS = 800
 RUNNING_COLOR = "#1f77b4"
 WAITING_COLOR = "#d62728"
-PREEMPTED_COLOR = "#f0ad4e"
 
 
 def find_aisbench_plot_html(perf_dir: str) -> Optional[str]:
@@ -1145,11 +1076,7 @@ def bin_queue_series(
         if epoch is None:
             continue
         buckets.setdefault(int(epoch // BIN_SEC), []).append(sample)
-    has_swapped = any(item.get("num_swapped") is not None for item in role_samples)
-    has_preempt_counter = any(item.get("num_preemptions_total") is not None for item in role_samples)
-    show_preempted = has_swapped or has_preempt_counter
-    xs, running, waiting, preempted, hover = [], [], [], [], []
-    prev_preempt: Dict[str, float] = {}
+    xs, running, waiting, hover = [], [], [], []
     for key in sorted(buckets):
         group = buckets[key]
         start_epoch = key * BIN_SEC
@@ -1160,36 +1087,16 @@ def bin_queue_series(
             last_by_endpoint[str(sample.get("endpoint") or "")] = sample
         run_v = sum(float(item.get("num_running") or 0) for item in last_by_endpoint.values())
         wait_v = sum(float(item.get("num_waiting") or 0) for item in last_by_endpoint.values())
-        preempt_v = 0.0
-        used_events = False
-        for endpoint, item in last_by_endpoint.items():
-            swapped = item.get("num_swapped")
-            total = item.get("num_preemptions_total")
-            if swapped is not None and float(swapped) > 0:
-                preempt_v += float(swapped)
-            elif total is not None:
-                prev = prev_preempt.get(endpoint)
-                if prev is not None:
-                    delta = max(0.0, float(total) - prev)
-                    preempt_v += delta
-                    if delta:
-                        used_events = True
-                prev_preempt[endpoint] = float(total)
-            elif swapped is not None:
-                preempt_v += float(swapped)
         running.append(run_v)
         waiting.append(wait_v)
-        preempted.append(preempt_v)
-        preempt_note = "本秒抢占次数" if used_events or (has_preempt_counter and not has_swapped) else "swapped占用"
         hover.append(
             f"角色: {role_label(role)}<br>"
             f"时间窗: {start_dt.strftime('%H:%M:%S')} ~ "
             f"{datetime.fromtimestamp(start_epoch + BIN_SEC).strftime('%H:%M:%S')}<br>"
             f"Running: {int(run_v)}<br>Waiting: {int(wait_v)}<br>"
-            f"Running (preempted): {int(preempt_v)}（{preempt_note}）<br>"
-            f"合计: {int(run_v + wait_v + preempt_v)}"
+            f"合计: {int(run_v + wait_v)}"
         )
-    return xs, running, waiting, preempted, hover, show_preempted
+    return xs, running, waiting, hover
 
 
 def parse_last_progress_start(log_path: str) -> Optional[datetime]:
@@ -1597,18 +1504,19 @@ def _legend_style(x: float, y: float, xanchor: str, yanchor: str) -> dict:
     )
 
 
-def _legend_below_subplot(fig, xaxis_key: str, yaxis_key: str) -> dict:
-    """图例水平挂在子图正下方（图外，不挡数据也不挡相邻图）。
+def _legend_below_subplot(fig, xaxis_key: str, yaxis_key: str, x_frac: float = 0.5) -> dict:
+    """图例垂直挂在子图正下方（图外、水平位置由 x_frac 控制，不挡 X 轴刻度标签）。
 
-    悬浮于子图 domain 底边之下的行间隙中；水平排布只占一行高度，
-    与下一行的子图标题（位于间隙上部）错开。
+    x_frac=0.5 居中；per-DP 队列图双列图例时 Running 列用 0.28、Waiting 列用 0.72。
+    每项独占一行（颜色标记 + 指标名 + max/min/avg 统计由调用方注入 trace.name），
+    plotly 原生支持点击图例项切换对应数据线显隐。
     """
-    x0 = list(fig.layout[xaxis_key].domain or [0, 1])[0]
+    x0, x1 = list(fig.layout[xaxis_key].domain or [0, 1])
     y0 = list(fig.layout[yaxis_key].domain or [0, 1])[0]
     return dict(
-        x=x0,
-        y=y0 - 0.006,
-        xanchor="left",
+        x=x0 + (x1 - x0) * x_frac,
+        y=y0 - 0.018,
+        xanchor="center",
         yanchor="top",
         bgcolor="rgba(255,255,255,0)",
         borderwidth=0,
@@ -1616,8 +1524,39 @@ def _legend_below_subplot(fig, xaxis_key: str, yaxis_key: str) -> dict:
         itemsizing="constant",
         itemwidth=30,
         tracegroupgap=2,
-        orientation="h",
+        orientation="v",
     )
+
+
+def _inject_trace_stats_name(fig, xaxis_key: str, skip: bool) -> None:
+    """向子图内各数据 trace 的图例名追加 max/min/avg 统计（跳过外部 plot 与表格）。
+
+    外部 gsm8k_plot trace（图 1 请求时间轴 / 并发数图）的 y 是 Request Index 等序号，
+    统计无意义，由调用方以 skip=True 跳过。
+    """
+    if skip:
+        return
+    short_x = "x" if xaxis_key == "xaxis" else "x" + xaxis_key.replace("xaxis", "")
+    for trace in fig.data:
+        if getattr(trace, "type", None) == "table":
+            continue
+        if str(getattr(trace, "xaxis", "x") or "x") != short_x:
+            continue
+        name = getattr(trace, "name", None)
+        if not name:
+            continue
+        if getattr(trace, "type", "") == "bar" and getattr(trace, "orientation", "") == "h":
+            # 水平分段时间线（图 3）：时长在 x（date 轴内部单位 ms → 秒），y 是 Request Index 不参与统计
+            raw = [v for v in (trace.x or []) if isinstance(v, (int, float))]
+            numeric = [v / 1000.0 for v in raw]
+        else:
+            ys = getattr(trace, "y", None)
+            numeric = [v for v in ys if isinstance(v, (int, float))] if ys else []
+        if not numeric:
+            continue
+        mx, mn = max(numeric), min(numeric)
+        avg = sum(numeric) / len(numeric)
+        trace.name = f"{name}  max {mx:.2f} / min {mn:.2f} / avg {avg:.2f}"
 
 
 def _adaptive_legend_box(fig, xaxis_key: str, yaxis_key: str, ys: List[Any], prefer: str = "topright") -> dict:
@@ -1721,50 +1660,27 @@ def _add_kv_lines(fig, samples: List[Dict[str, Any]], row: int, col: int, legend
 
 
 def _add_queue_bars(fig, samples: List[Dict[str, Any]], role: str, row: int, col: int, legend: str) -> None:
-    xs, running, waiting, preempted, hover, show_preempted = bin_queue_series(samples, role)
+    """图 5/6：P/D 节点队列 Running/Waiting 独立折线散点图（不堆叠）。
+
+    每个指标一条带数据点的折线（lines+markers），各自独立 Y 轴数据逻辑；
+    图例项点击可单独切换显隐，统计（max/min/avg）由统一入口注入图例名。
+    """
+    xs, running, waiting, hover = bin_queue_series(samples, role)
     label = role_label(role)
-    fig.add_trace(
-        go.Bar(
-            x=xs,
-            y=running,
-            name=f"{label} Running",
-            legend=legend,
-            legendgroup=f"{legend}-running",
-            marker_color=RUNNING_COLOR,
-            width=QUEUE_BAR_WIDTH_MS,
-            hovertemplate="%{hovertext}<extra></extra>",
-            hovertext=hover,
-            showlegend=True,
-        ),
-        row=row,
-        col=col,
-    )
-    fig.add_trace(
-        go.Bar(
-            x=xs,
-            y=waiting,
-            name=f"{label} Waiting",
-            legend=legend,
-            legendgroup=f"{legend}-waiting",
-            marker_color=WAITING_COLOR,
-            width=QUEUE_BAR_WIDTH_MS,
-            hovertemplate="%{hovertext}<extra></extra>",
-            hovertext=hover,
-            showlegend=True,
-        ),
-        row=row,
-        col=col,
-    )
-    if show_preempted:
+    series = [
+        (f"{label} Running", running, RUNNING_COLOR),
+        (f"{label} Waiting", waiting, WAITING_COLOR),
+    ]
+    for name, ys, color in series:
         fig.add_trace(
-            go.Bar(
+            go.Scatter(
                 x=xs,
-                y=preempted,
-                name=f"{label} Running (preempted)",
+                y=ys,
+                mode="lines+markers",
+                name=name,
                 legend=legend,
-                legendgroup=f"{legend}-preempted",
-                marker_color=PREEMPTED_COLOR,
-                width=QUEUE_BAR_WIDTH_MS,
+                line=dict(color=color, width=1.6),
+                marker=dict(color=color, size=5),
                 hovertemplate="%{hovertext}<extra></extra>",
                 hovertext=hover,
                 showlegend=True,
@@ -1772,17 +1688,14 @@ def _add_queue_bars(fig, samples: List[Dict[str, Any]], role: str, row: int, col
             row=row,
             col=col,
         )
-    y_title = f"{label} 队列请求数（Running+Waiting"
-    y_title += "+Preempted）" if show_preempted else "）"
     fig.update_yaxes(
-        title_text=y_title,
+        title_text=f"{label} 队列请求数",
         **AXIS_CONFIG,
         rangemode="tozero",
         row=row,
         col=col,
     )
     fig.update_xaxes(
-        title_text="时间（每1秒一组）",
         type="date",
         tickformat="%H:%M:%S",
         **AXIS_CONFIG,
@@ -1838,7 +1751,6 @@ def _add_kv_lines_per_engine(fig, samples: List[Dict[str, Any]], row: int, col: 
                 mode="lines+markers",
                 name=f"DP-{eid}",
                 legend=legend,
-                legendgroup=f"{legend}-dp{eid}",
                 line=dict(color=color, width=2),
                 marker=dict(size=4),
                 hovertemplate="%{text}<extra></extra>",
@@ -1853,8 +1765,14 @@ def _add_kv_lines_per_engine(fig, samples: List[Dict[str, Any]], row: int, col: 
     fig.update_xaxes(type="date", tickformat="%H:%M:%S", **AXIS_CONFIG, row=row, col=col)
 
 
-def _add_queue_bars_per_engine(fig, samples: List[Dict[str, Any]], role: str, row: int, col: int, legend: str) -> None:
-    """图6: 每个 DP engine 的 Running/Waiting 堆叠柱形图（8个DP，每个DP有running+waiting两色）。"""
+def _add_queue_bars_per_engine(fig, samples: List[Dict[str, Any]], role: str, row: int, col: int,
+                               legend: str, legend_wait: str = "") -> None:
+    """图 9/10（混部图 6）：各 DP 的 Running / Waiting 独立折线散点图。
+
+    Running 与 Waiting 拆分为独立数据线（不堆叠、无 legendgroup）：各自的图例项
+    可单独点击切换显隐，统计（max/min/avg）由统一入口注入图例名。图例拆分两列——
+    左列 Running（legend）、右列 Waiting（legend_wait），同色系深浅对照。
+    """
     engine_ids: set = set()
     for sample in samples:
         if sample.get("role") != role:
@@ -1864,16 +1782,9 @@ def _add_queue_bars_per_engine(fig, samples: List[Dict[str, Any]], role: str, ro
     if not engine_ids:
         return
     sorted_eids = sorted(engine_ids, key=int)
-    n_engines = len(sorted_eids)
-    bar_width_s = 0.08  # 80ms per bar
-    # x offset for each engine within the 1-second bin
-    offsets = {eid: (int(eid) - (n_engines - 1) / 2.0) * bar_width_s for eid in sorted_eids}
-
-    from datetime import timedelta as _td
-    bar_width_ms = bar_width_s * 1000
 
     for eid in sorted_eids:
-        xs, ys_r, ys_w, hover = [], [], [], []
+        xs, ys_r, ys_w, hover_r, hover_w = [], [], [], [], []
         for sample in samples:
             if sample.get("role") != role:
                 continue
@@ -1884,57 +1795,57 @@ def _add_queue_bars_per_engine(fig, samples: List[Dict[str, Any]], role: str, ro
             ts = _to_dt(sample.get("timestamp"))
             if ts is None:
                 continue
-            ts = ts + _td(seconds=offsets[eid])
             run_v = float(eng.get("num_running") or 0)
             wait_v = float(eng.get("num_waiting") or 0)
             xs.append(ts)
             ys_r.append(run_v)
             ys_w.append(wait_v)
-            hover.append(
-                f"DP-{eid}<br>"
-                f"时间: {sample.get('timestamp')}<br>"
-                f"Running: {int(run_v)}<br>"
-                f"Waiting: {int(wait_v)}"
+            hover_r.append(
+                f"DP-{eid} Running<br>时间: {sample.get('timestamp')}<br>Running: {int(run_v)}"
+            )
+            hover_w.append(
+                f"DP-{eid} Waiting<br>时间: {sample.get('timestamp')}<br>Waiting: {int(wait_v)}"
             )
         color = DP_LINE_PALETTE[int(eid) % len(DP_LINE_PALETTE)]
-        # Lighter shade for waiting (same hue, higher lightness)
+        # Waiting 同色系浅色（同 hue 提亮），与 Running 拆分为两条独立折线（不堆叠）
         waiting_color = _lighten_color(color, 0.45)
-        # Running bar (bottom of stack, shows in legend)
+        # Running 折线（实色，左列图例项，独立显隐）
         fig.add_trace(
-            go.Bar(
+            go.Scatter(
                 x=xs,
                 y=ys_r,
-                name=f"DP-{eid}",
+                mode="lines+markers",
+                name=f"DP-{eid} Running",
                 legend=legend,
-                legendgroup=f"{legend}-dp{eid}",
-                marker_color=color,
-                width=bar_width_ms,
+                line=dict(color=color, width=1.6),
+                marker=dict(color=color, size=4),
                 hovertemplate="%{hovertext}<extra></extra>",
-                hovertext=hover,
+                hovertext=hover_r,
                 showlegend=True,
             ),
             row=row,
             col=col,
         )
-        # Waiting bar (top of stack, lighter shade, no legend)
+        # Waiting 折线（浅色，右列独立图例项，独立显隐与独立统计）
         fig.add_trace(
-            go.Bar(
+            go.Scatter(
                 x=xs,
                 y=ys_w,
+                mode="lines+markers",
                 name=f"DP-{eid} Waiting",
-                legend=legend,
-                legendgroup=f"{legend}-dp{eid}",
-                marker_color=waiting_color,
-                width=bar_width_ms,
+                legend=legend_wait or legend,
+                line=dict(color=waiting_color, width=1.4),
+                marker=dict(color=waiting_color, size=4),
                 hovertemplate="%{hovertext}<extra></extra>",
-                hovertext=hover,
-                showlegend=False,
+                hovertext=hover_w,
+                showlegend=True,
             ),
             row=row,
             col=col,
         )
     fig.update_yaxes(title_text="各 DP 队列请求数", **AXIS_CONFIG, rangemode="tozero", row=row, col=col)
-    fig.update_xaxes(title_text="时间（每1秒一组）", type="date", tickformat="%H:%M:%S", **AXIS_CONFIG, row=row, col=col)
+    fig.update_xaxes(type="date", tickformat="%H:%M:%S", **AXIS_CONFIG, row=row, col=col)
+
 
 def _add_kv_stage_bars(fig, kv_stage_data: Dict[str, Any], row: int, col: int, legend: str = "legend3") -> None:
     """图 3：请求五阶段水平分段时间线（绝对时间轴，与全图联动框选）。
@@ -1973,34 +1884,7 @@ def _add_kv_stage_bars(fig, kv_stage_data: Dict[str, Any], row: int, col: int, l
             row=row,
             col=col,
         )
-    # avg 汇总两行表格：HTML <table> 保证列对齐，"avg(s)" 放左下角占位不挤占数值列；
-    # 位置在图例正下方（图例 y0-0.006、高约 0.01，表格再往下），与图例左对齐
-    display_order = ["p_waiting", "p_running", "kv_transfer", "d_waiting", "d_running"]
-    heads, vals = [], []
-    for key in display_order:
-        stage = summary.get(key)
-        if not stage:
-            continue
-        heads.append(STAGE_LABELS.get(key, key))
-        vals.append(f"{stage['avg']:.3f}")
-    if heads:
-        # 从刚添加的 bar trace 反查本子图 axis key（tr.xaxis 形如 "x3"），规避 colspan 编号陷阱
-        last_trace = fig.data[-1]
-        xaxis_key = "xaxis" if last_trace.xaxis in (None, "x") else f"xaxis{last_trace.xaxis[1:]}"
-        yaxis_key = "yaxis" if last_trace.yaxis in (None, "y") else f"yaxis{last_trace.yaxis[1:]}"
-        x0 = list(fig.layout[xaxis_key].domain or [0, 1])[0]
-        y0 = list(fig.layout[yaxis_key].domain or [0, 1])[0]
-        # 单行 avg 汇总文本（不依赖等宽字体/表格对齐）：单位在最前，五阶段名 + 平均值逐项列出
-        pairs = [f"{h} {v}" for h, v in zip(heads, vals)]
-        text = "avg(s)：" + "，".join(pairs)
-        fig.add_annotation(
-            text=text,
-            xref="paper", yref="paper",
-            x=x0, y=y0 - 0.020, xanchor="left", yanchor="top",
-            showarrow=False,
-            align="left",
-            font=dict(size=10, color="#333333"),
-        )
+    # avg 汇总已并入图例名（max/min/avg 由 _inject_trace_stats_name 统一注入），不再单独画 annotation
     # 照搬图 1：warmup 与 full 各自从 1 起编号、共用同一根轴；warmup bar 半透明区分
     # （图 1 的 warmup trace 为虚线，bar 无线型故用透明度），不占图例位，hover 标 [warmup]
     warmup_y = kv_stage_data.get("warmup_y") or []
@@ -2026,8 +1910,8 @@ def _add_kv_stage_bars(fig, kv_stage_data: Dict[str, Any], row: int, col: int, l
                 row=row,
                 col=col,
             )
-    # 与全图共用主时间轴（框选任意图联动）+ 相同刻度格式；matches 由外层统一设置，此处双保险
-    fig.update_xaxes(type="date", matches="x", tickformat="%H:%M:%S", **AXIS_CONFIG, row=row, col=col)
+    # 时间轴刻度与全图一致（各图独立缩放，互不影响）
+    fig.update_xaxes(type="date", tickformat="%H:%M:%S", **AXIS_CONFIG, row=row, col=col)
     fig.update_yaxes(title_text="Request Index", **AXIS_CONFIG, row=row, col=col)
 
 
@@ -2112,7 +1996,7 @@ def write_metrics_html(
             "图1 请求时间轴（来自 gsm8k_plot）",
             "图2 KV Cache 占用率随时间变化",
             "图3 请求并发数（来自 gsm8k_plot）",
-            "图4 混部 Running/Waiting/Preempted 队列（每1秒）",
+            "图4 混部 Running/Waiting 队列（每1秒）",
             "图5 各 DP KV Cache 占用率",
             "图6 各 DP Running/Waiting 队列",
             "图7 ais_bench 测试结果",
@@ -2141,8 +2025,8 @@ def write_metrics_html(
                 "图2 KV Cache 占用率随时间变化",
                 f"图3 请求五阶段耗时构成：P 等待 / P 执行 / KV 拉取 / D 等待 / D 执行{kv_sample_note}",
                 "图4 请求并发数（来自 gsm8k_plot）",
-                "图5 P 节点 Running/Waiting/Preempted 队列（每1秒）",
-                "图6 D 节点 Running/Waiting/Preempted 队列（每1秒）",
+                "图5 P 节点 Running/Waiting 队列（每1秒）",
+                "图6 D 节点 Running/Waiting 队列（每1秒）",
                 "图7 P 节点各 DP KV Cache 占用率",
                 "图8 D 节点各 DP KV Cache 占用率",
                 "图9 P 节点各 DP Running/Waiting 队列",
@@ -2164,9 +2048,9 @@ def write_metrics_html(
                 "图1 请求时间轴（来自 gsm8k_plot）",
                 "图2 KV Cache 占用率随时间变化",
                 "图3 请求并发数（来自 gsm8k_plot）",
-                "图4 P 节点 Running/Waiting/Preempted 队列（每1秒）",
+                "图4 P 节点 Running/Waiting 队列（每1秒）",
                 "图5 P 节点各 DP KV Cache 占用率",
-                "图6 D 节点 Running/Waiting/Preempted 队列（每1秒）",
+                "图6 D 节点 Running/Waiting 队列（每1秒）",
                 "图7 P 节点各 DP Running/Waiting 队列",
                 "图8 D 节点各 DP KV Cache 占用率",
                 "图9 D 节点各 DP Running/Waiting 队列",
@@ -2239,7 +2123,7 @@ def write_metrics_html(
     if colocated:
         _add_queue_bars(fig, samples, role="M", row=2, col=2, legend="legend4")
         _add_kv_lines_per_engine(fig, samples, row=3, col=1, legend="legend5", role="M")
-        _add_queue_bars_per_engine(fig, samples, role="M", row=3, col=2, legend="legend6")
+        _add_queue_bars_per_engine(fig, samples, role="M", row=3, col=2, legend="legend6", legend_wait="legend7")
     elif has_kv_stage:
         # 新布局：左 P 右 D 成对排列（行3 队列、行4 KV、行5 队列明细）
         _add_kv_stage_bars(fig, kv_stage_data, row=2, col=1, legend="legend3")
@@ -2247,15 +2131,15 @@ def write_metrics_html(
         _add_queue_bars(fig, samples, role="D", row=3, col=2, legend="legend6")
         _add_kv_lines_per_engine(fig, samples, row=4, col=1, legend="legend7", role="P")
         _add_kv_lines_per_engine(fig, samples, row=4, col=2, legend="legend8", role="D")
-        _add_queue_bars_per_engine(fig, samples, role="P", row=5, col=1, legend="legend9")
-        _add_queue_bars_per_engine(fig, samples, role="D", row=5, col=2, legend="legend10")
+        _add_queue_bars_per_engine(fig, samples, role="P", row=5, col=1, legend="legend9", legend_wait="legend11")
+        _add_queue_bars_per_engine(fig, samples, role="D", row=5, col=2, legend="legend10", legend_wait="legend12")
     else:
         _add_queue_bars(fig, samples, role="P", row=2, col=2, legend="legend4")
         _add_queue_bars(fig, samples, role="D", row=3, col=2, legend="legend6")
         _add_kv_lines_per_engine(fig, samples, row=3, col=1, legend="legend5", role="P")
         _add_kv_lines_per_engine(fig, samples, row=4, col=2, legend="legend8", role="D")
-        _add_queue_bars_per_engine(fig, samples, role="P", row=4, col=1, legend="legend7")
-        _add_queue_bars_per_engine(fig, samples, role="D", row=5, col=1, legend="legend9")
+        _add_queue_bars_per_engine(fig, samples, role="P", row=4, col=1, legend="legend7", legend_wait="legend10")
+        _add_queue_bars_per_engine(fig, samples, role="D", row=5, col=1, legend="legend9", legend_wait="legend11")
     _add_phase_bands(fig, phases, stopped_at, list(cartesian_cells))
 
     perf_dir = os.path.dirname(os.path.abspath(output_path))
@@ -2263,11 +2147,22 @@ def write_metrics_html(
     fig.add_trace(_build_result_table_trace(csv_rows, json_rows), row=table_row, col=table_col)
 
     for row, col in cartesian_cells[1:]:
-        fig.update_xaxes(matches="x", type="date", tickformat="%H:%M:%S", row=row, col=col)
+        fig.update_xaxes(type="date", tickformat="%H:%M:%S", row=row, col=col)
     fig.update_xaxes(type="date", tickformat="%H:%M:%S", row=1, col=1)
 
     axis_pairs = _ordered_cartesian_axis_pairs(fig)
     legend_layout = {}
+    # per-DP 队列图的双列图例：主图例（Running 列）挪到子图左 28%，
+    # waiting 图例（Waiting 列）放右 72%，两列并排对照（plotly legend 名仅允许 legend<整数>，
+    # waiting 图例编号在对应布局分支显式指定）
+    if colocated:
+        wait_legend_of = {"legend6": "legend7"}
+    elif kv_stage_data:
+        wait_legend_of = {"legend9": "legend11", "legend10": "legend12"}
+    else:
+        wait_legend_of = {"legend7": "legend10", "legend9": "legend11"}
+    # 图 1（1,1）与并发数图是外部 gsm8k_plot trace（y 为序号），统计注入跳过
+    skip_stats_cells = {(1, 1), (conc_row, conc_col)}
     for (_row, _col), (xk, yk), legend_key, prefer in zip(
         cartesian_cells, axis_pairs, legend_keys, prefers
     ):
@@ -2278,7 +2173,18 @@ def write_metrics_html(
                 continue
             if str(getattr(trace, "xaxis", "x") or "x") == short_x and getattr(trace, "y", None) is not None:
                 ys.extend(list(trace.y))
-        legend_layout[legend_key] = _legend_below_subplot(fig, xk, yk)
+        _inject_trace_stats_name(fig, xk, skip=(_row, _col) in skip_stats_cells)
+        legend_layout[legend_key] = _legend_below_subplot(
+            fig, xk, yk, x_frac=0.28 if legend_key in wait_legend_of else 0.5
+        )
+    # Waiting 列图例（右列），与主图例同一子图下方
+    for main_lg, wait_lg in wait_legend_of.items():
+        if wait_lg in legend_layout:
+            continue
+        tr = next(t for t in fig.data if str(getattr(t, "legend", "")) == wait_lg)
+        xk = "xaxis" if tr.xaxis in (None, "x") else f"xaxis{tr.xaxis[1:]}"
+        yk = "yaxis" if tr.yaxis in (None, "y") else f"yaxis{tr.yaxis[1:]}"
+        legend_layout[wait_lg] = _legend_below_subplot(fig, xk, yk, x_frac=0.72)
 
     hit_line = format_hit_rate_parenthetical(hit_rate_summary)
     fig.update_layout(
@@ -2313,5 +2219,4 @@ def write_metrics_html(
         config=WEBGL_CONFIG,
         auto_open=False,
         full_html=True,
-        post_script=RELAYOUT_SYNC_JS,
     )
