@@ -14,28 +14,71 @@
 
 ## 2. 快速开始
 
-```bash
-# 进入带 ais_bench 的环境（mindie/vllm 镜像均已打包），另需安装：
-pip install transformers plotly tabulate requests
+> 前置：进入已安装 ais_bench 的环境（mindie/vllm 镜像均已打包），另需 `pip install transformers plotly tabulate requests`。
 
+### 2.1 config.py 配置方法
+
+从模板复制一份改名为 `config.py`（二选一，模板差异见[第 3 节](#3-configpy-模板二选一)）：
+
+```bash
 git clone https://github.com/gaoyuan777/aisbench-prefix-test-tool.git
 cd aisbench-prefix-test-tool
-
-# 按部署形态复制对应模板为 config.py，修改其中的地址/路径
-cp config_template_colocated.py config.py   # 混部
-# 或 cp config_template_pd.py config.py     # PD 分离
-
-python3 aisbench_test.py --input_len 2048 --output_len 2048 --data_num 160 --concurrency 40 --request_rate 10
+cp config_template_colocated.py config.py   # 混部形态
+# 或 cp config_template_pd.py config.py     # PD 分离形态
 ```
 
-`DATASET_PATH` 指向的文件夹需提前创建。
+然后按实际环境修改以下关键项（以**混部单实例**为例）：
+
+```python
+# ── 测试目标（必改）─────────────────────────────
+MODEL_NAME = "deepseek-v4-flash"      # 服务的 --served-model-name
+MODEL_PATH = "/home/user/DeepSeek-V4-Flash-0731-w8a8"   # 模型权重路径（tokenizer 用）
+HOST_IP = "192.168.1.10"              # 测试目标 IP
+HOST_PORT = "8077"                    # 测试目标端口：混部填服务端口，PD 分离填 proxy 端口
+
+# ── 数据集与输出 ────────────────────────────────
+DATASET_PATH = "./dataset"            # 数据集生成目录（文件夹需提前创建）
+OUTPUT_DIR = "./outputs"              # 测试输出根目录
+DEFAULT_PERFORMANCE_TEST = "stable_stage"   # 统计口径：stable_stage（稳态）/ default_perf（全量）
+
+# ── 运行时监控（可选，不填则不生成 HTML）─────────
+POD_INFO = ["192.168.1.10:8077"]      # 命中率统计地址；混部填服务地址，PD 填 P 节点各 DP 域端口
+M_LISTEN_SERVER = "192.168.1.10:8077" # 混部监控（填 vLLM 引擎端口，勿填 proxy）
+# P_LISTEN_SERVER = "192.168.1.10:9000"   # PD 分离：P 节点各 DP 域 metrics 端口
+# D_LISTEN_SERVER = "192.168.1.10:10001"  # PD 分离：D 节点各 DP 域 metrics 端口
+
+# ── 五阶段耗时分析（可选，仅 PD 分离，详见第 10 章）──
+KV_STAGE_LOG_P = ""                   # P 节点 vllm 日志路径，留空不启用
+KV_STAGE_LOG_D = ""                   # D 节点 vllm 日志路径，留空不启用
+```
+
+配置完成后跑一条最短冒烟：`python3 aisbench_test.py --input_len 64 --output_len 1 --data_num 2 --concurrency 2`，能正常产出 `aisbench_result.csv` 即配置无误。
+
+### 2.2 启动测试方法
+
+```bash
+python3 aisbench_test.py \
+  --input_len 4096 \
+  --output_len 1 \
+  --data_num 4 \
+  --concurrency 1 \
+  --request_rate 0 \
+  --test_type stream \
+  --repeat_rate 1 \
+  --dataset_type prefix_cache \
+  --prefix_test \
+  --dp 1 \
+  --output_dir ./outputs/4k_1_cc_1_data_4_repeat_rate_0
+```
+
+该用例：4 条输入 4096 的请求、单并发、流式、全量重复前缀（repeat_rate=1），先 warmup 预热再跑全量，输出到 `./outputs/4k_1_cc_1_data_4_repeat_rate_0`。参数含义见[第 5 节](#5-命令行参数)，更多场景见[第 8 节](#8-使用示例)。
 
 ## 3. config.py 模板（二选一）
 
 | 形态 | 模板文件 | 关键差异 |
 | --- | --- | --- |
 | 混部 | `config_template_colocated.py` | `HOST_*` 填 vLLM 服务地址；监控只填 `M_LISTEN_SERVER`；`POD_INFO` 填服务地址 |
-| PD 分离 | `config_template_pd.py` | `HOST_*` 填 **proxy** 地址；`POD_INFO` 填 **P 节点各 DP 域端口**；监控填 `P_LISTEN_SERVER` / `D_LISTEN_SERVER` |
+| PD 分离 | `config_template_pd.py` | `HOST_*` 填 **proxy** 地址；`POD_INFO` 填 **P 节点各 DP 域端口**（如需统计 D 节点 decode 命中，D 侧端口一并填入）；监控填 `P_LISTEN_SERVER` / `D_LISTEN_SERVER` |
 
 公共规则：
 
@@ -181,7 +224,7 @@ outputs/<目录>/<时间戳>/performances/vllm-api-stream-chat/vllm_pd_runtime_m
 - 实时数据覆盖写入 `pd_metrics_live.txt`，另开终端 `tail -F pd_metrics_live.txt` 查看
 - 前缀命中率写入 `aisbench_result.csv` 与 HTML 标题下方
 
-**混部布局（7 图）**：请求时间轴 / KV 占用率（聚合平均）/ 并发数 / 队列柱状图 / 各 DP KV / 各 DP 队列 / 结果表
+**混部布局（7 图）**：请求时间轴 / KV 占用率（聚合平均）/ 并发数 / 队列折线图 / 各 DP KV / 各 DP 队列 / 结果表
 
 **PD 分离布局（默认 10 图）**：请求时间轴 / KV 占用率（**P/D 各一条平均线**）/ 并发数 / P 队列 / P 各 DP KV / D 队列 / P 各 DP 队列 / D 各 DP KV / D 各 DP 队列 / 结果表
 
