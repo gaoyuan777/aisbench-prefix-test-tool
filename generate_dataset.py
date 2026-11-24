@@ -1,9 +1,10 @@
 import logging
+import json
+import sys
 from transformers import AutoTokenizer
 from data_picker import *
 import os
 import random
-import torch
 
 try:
     from tqdm import tqdm
@@ -12,10 +13,16 @@ except ImportError:
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-def create_dataset(tokenizer_path: str, input_len: int, number: int, prefix_flag):
+def create_dataset(tokenizer_path: str, input_len: int, number: int, prefix_flag, rng=None):
 
     logging.info(f"加载tokenizer: {tokenizer_path}")
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+
+    if rng is None:
+        rng = random.Random()
+
+    # 每个 create_dataset 调用只创建一次挑选器，循环内复用（避免重复读取语料与计数）
+    picker = DataPicker("./GSM8K.jsonl", "./picked_ids.txt", prefix_flag, rng=rng)
 
     output_samples = []
     attempts = 0
@@ -25,7 +32,6 @@ def create_dataset(tokenizer_path: str, input_len: int, number: int, prefix_flag
     while len(output_samples) < number and attempts < max_attempts:
         attempts += 1
         # 随机选择一条文本
-        picker = DataPicker("./GSM8K.jsonl", "./picked_ids.txt", prefix_flag)
         raw_text = picker.pick_one()
         if raw_text is None:
             break
@@ -85,9 +91,9 @@ def generate_unique_tokens(tokenizer_path, seed, n, number):
     Returns:
         list: 包含 number 行数据的列表
     """
-    # 设置随机种子
-    random.seed(seed)
-    torch.manual_seed(seed)
+    # 使用局部 RNG（seed + 行号）保证行内容可复现，不再重设全局随机种子
+    if seed is None:
+        seed = 0
 
     # 加载 tokenizer
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
@@ -106,8 +112,7 @@ def generate_unique_tokens(tokenizer_path, seed, n, number):
             pbar.update(1)
         # 为每一行使用不同的种子，确保行间数据不重复
         line_seed = seed + line_idx
-        random.seed(line_seed)
-        torch.manual_seed(line_seed)
+        rng = random.Random(line_seed)
 
         unique_tokens = []
         seen_tokens = set()
@@ -116,7 +121,7 @@ def generate_unique_tokens(tokenizer_path, seed, n, number):
 
         while len(unique_tokens) < n and attempts < max_attempts:
             # 随机生成 token ID
-            token_id = random.randint(0, vocab_size - 1)
+            token_id = rng.randint(0, vocab_size - 1)
 
             # 检查是否重复
             if token_id in seen_tokens:
@@ -126,14 +131,24 @@ def generate_unique_tokens(tokenizer_path, seed, n, number):
             # 转换为文本
             try:
                 token_text = tokenizer.decode([token_id])
+            except Exception:
+                attempts += 1
+                continue
 
-                # 可选：跳过特殊 token 或空 token
-                # if token_text.strip() or token_text:  # 保留非空 token
-                unique_tokens.append(token_text)
-                seen_tokens.add(token_id)
-            except:
-                pass
+            # 跳过空 token 与特殊 token（round-trip 编码长度必须为 1 才算可用 token）
+            if not token_text.strip():
+                attempts += 1
+                continue
+            try:
+                if len(tokenizer.encode(token_text, add_special_tokens=False)) != 1:
+                    attempts += 1
+                    continue
+            except Exception:
+                attempts += 1
+                continue
 
+            unique_tokens.append(token_text)
+            seen_tokens.add(token_id)
             attempts += 1
 
         if len(unique_tokens) < n:
@@ -146,6 +161,9 @@ def generate_unique_tokens(tokenizer_path, seed, n, number):
     return all_lines
 
 def write_data(path, dataset, num):
+    if not isinstance(dataset, list) or len(dataset) == 0:
+        logging.error(f"数据集为空或类型非法，无法写入: {path}")
+        raise ValueError(f"数据集为空或类型非法，无法写入: {path}")
     if num is not None:
         if len(dataset) < num:
             # 重复数据
@@ -169,11 +187,13 @@ def sample_target_length(rng, fixed_length, length_mean=None, length_std=None, l
     lo = 1 if length_min is None else max(1, int(length_min))
     hi = None if length_max is None else max(1, int(length_max))
     if hi is not None and lo > hi:
-        lo, hi = hi, lo
+        raise ValueError(f"length_min({lo}) 不能大于 length_max({hi})")
 
     if has_gauss:
         mu = max(1, int(length_mean))
         sigma = max(0.0, float(length_std))
+        if float(length_std) < 0:
+            logging.debug(f"length_std 为负({length_std})，已钳制为 0")
         val = mu if sigma == 0 else int(round(rng.gauss(mu, sigma)))
         if hi is not None:
             val = min(val, hi)
@@ -208,6 +228,29 @@ def _truncate_or_pad_text(tokenizer, text, target_len):
     return tokenizer.decode(tokens, skip_special_tokens=True)
 
 
+def expected_dataset_path(tokenizer_path, input_len, number, save_path, prefix_flag, repeat_rate,
+                          length_mean=None, length_std=None, length_min=None, length_max=None):
+    """返回 create_multi_prefix_dataset 针对相同参数将写出的主数据集路径（无副作用、无 IO）"""
+    base_name = os.path.basename(os.path.normpath(tokenizer_path))
+    use_variable_length = (
+        (length_mean is not None and length_std is not None)
+        or (length_min is not None and length_max is not None)
+    )
+
+    if prefix_flag == 0:
+        if use_variable_length:
+            length_tag = _build_length_tag(input_len, length_mean, length_std, length_min, length_max)
+            return os.path.join(save_path, f'GSM8K-{length_tag}-num{number}-{base_name}.jsonl')
+        return os.path.join(save_path, f'GSM8K-in{input_len}-num{number}-{base_name}.jsonl')
+
+    # 前缀数据集的命名依赖 run 时的 tokenizer 与逐行实际长度，无法从参数静态推导；
+    # 唯一调用方（aisbench_test.create_gsm8k_dataset）只用 prefix_flag=0。
+    raise NotImplementedError(
+        "expected_dataset_path 仅支持 prefix_flag=0；前缀数据集请直接使用 "
+        "create_multi_prefix_dataset 返回的路径"
+    )
+
+
 def create_multi_prefix_dataset(tokenizer_path: str, input_len: int, number: int, save_path, prefix_flag, dp, repeat_rate, seed, prefix_num,
                                 length_mean=None, length_std=None, length_min=None, length_max=None):
     base_name = os.path.basename(os.path.normpath(tokenizer_path))
@@ -215,18 +258,19 @@ def create_multi_prefix_dataset(tokenizer_path: str, input_len: int, number: int
         (length_mean is not None and length_std is not None)
         or (length_min is not None and length_max is not None)
     )
+    # 整个数据集共用一个 RNG，保证相同 seed 下内容可复现
+    rng = random.Random(seed)
 
     # ========== 普通数据集（无前缀）==========
     if prefix_flag == 0:
         if use_variable_length:
-            rng = random.Random(seed)
             real_lens = [max(1, int(sample_target_length(rng, input_len, length_mean, length_std, length_min, length_max))) for _ in range(number)]
             max_len = max(real_lens)
             # 先生成统一最大长度的文本池，再逐条截断
-            long_texts = create_dataset(tokenizer_path, max_len, number, 0)
+            long_texts = create_dataset(tokenizer_path, max_len, number, 0, rng=rng)
             if long_texts is None:
                 logging.error("生成数据集失败，请清空picked ids")
-                exit(0)
+                sys.exit(1)
             tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
             dataset = []
             pbar = tqdm(total=number, desc="Truncating to variable lengths", unit="row") if tqdm else None
@@ -242,7 +286,7 @@ def create_multi_prefix_dataset(tokenizer_path: str, input_len: int, number: int
             write_data(dataset_path, dataset, number)
             return "", dataset_path
         else:
-            dataset = create_dataset(tokenizer_path, input_len, number, 0)
+            dataset = create_dataset(tokenizer_path, input_len, number, 0, rng=rng)
             dataset_path = os.path.join(save_path, f'GSM8K-in{input_len}-num{number}-{base_name}.jsonl')
             write_data(dataset_path, dataset, number)
             return "", dataset_path
@@ -250,15 +294,20 @@ def create_multi_prefix_dataset(tokenizer_path: str, input_len: int, number: int
     # ========== 前缀数据集 ==========
     if use_variable_length:
         return _create_prefix_dataset_variable(tokenizer_path, input_len, number, save_path, base_name, dp, repeat_rate, seed, prefix_num,
-                                               length_mean, length_std, length_min, length_max)
+                                               length_mean, length_std, length_min, length_max, rng=rng)
 
     # -------- 定长前缀数据集（原有逻辑）--------
     prefix_len = int(input_len * repeat_rate)
+    # repeat_rate<1 时后缀需要至少 3 个分隔 token 的空间；不足时钳制前缀长度，避免生成负长度后缀
+    if repeat_rate < 1 and input_len - prefix_len < 3:
+        adjusted_prefix_len = max(0, input_len - 3)
+        logging.warning(f"前缀长度 {prefix_len} 过大，输入长度 {input_len} 无法容纳 3 个分隔 token，已调整为 {adjusted_prefix_len}")
+        prefix_len = adjusted_prefix_len
     prefix_data = []
-    prefix_data = create_dataset(tokenizer_path, prefix_len, prefix_num, 1)
+    prefix_data = create_dataset(tokenizer_path, prefix_len, prefix_num, 1, rng=rng)
     if prefix_data == None and repeat_rate > 0:
         logging.error(f"生成数据集失败，请清空picked ids")
-        exit(0)
+        sys.exit(1)
 
     # warmup 数据量 = prefix_num × 2 × dp（每前缀每 DP 域 2 条），前缀轮流填充
     warmup_total = prefix_num * dp * 2
@@ -273,9 +322,9 @@ def create_multi_prefix_dataset(tokenizer_path: str, input_len: int, number: int
 
     # 前缀后插入3个随机token
     uniq_token_set = generate_unique_tokens(tokenizer_path, seed, 3, number)
-    # 后缀数据
-    suffix_len = int(input_len - prefix_len - 3)
-    suffix_dataset = create_dataset(tokenizer_path, suffix_len, number, 0)
+    # 后缀数据（已钳制前缀长度，这里再做一次非负兜底）
+    suffix_len = max(0, int(input_len - prefix_len - 3))
+    suffix_dataset = create_dataset(tokenizer_path, suffix_len, number, 0, rng=rng)
 
     # 拼接完整数据集
     dataset = []
@@ -297,22 +346,35 @@ def create_multi_prefix_dataset(tokenizer_path: str, input_len: int, number: int
 
 
 def _create_prefix_dataset_variable(tokenizer_path, input_len, number, save_path, base_name, dp, repeat_rate, seed, prefix_num,
-                                    length_mean, length_std, length_min, length_max):
+                                    length_mean, length_std, length_min, length_max, rng=None):
     """变长前缀数据集生成：预采样长度 → 前缀池 → 逐条截断前缀/后缀并拼接"""
-    rng = random.Random(seed)
+    if rng is None:
+        rng = random.Random(seed)
 
     # 预采样每条数据的实际长度和公共前缀长度
     real_lens = [max(1, int(sample_target_length(rng, input_len, length_mean, length_std, length_min, length_max))) for _ in range(number)]
-    common_lens = [max(0, min(rl, int(round(rl * repeat_rate)))) for rl in real_lens]
+    # repeat_rate<1 时每条数据需保留至少 3 个分隔 token 的后缀空间，逐条钳制公共前缀长度
+    common_lens = []
+    adjusted_count = 0
+    for rl in real_lens:
+        cl = max(0, min(rl, int(round(rl * repeat_rate))))
+        if repeat_rate < 1 and rl - cl < 3:
+            new_cl = max(0, rl - 3)
+            if new_cl != cl:
+                adjusted_count += 1
+                cl = new_cl
+        common_lens.append(cl)
+    if adjusted_count:
+        logging.warning(f"有 {adjusted_count} 条数据前缀长度过大，已按 length-3 上限调整，最大公共前缀={max(common_lens) if common_lens else 0}")
     max_common_len = max(common_lens) if common_lens else 0
 
     # 生成前缀池（统一最大公共长度，后续逐条截断）
     prefix_data = []
     if max_common_len > 0:
-        prefix_data = create_dataset(tokenizer_path, max_common_len, prefix_num, 1)
+        prefix_data = create_dataset(tokenizer_path, max_common_len, prefix_num, 1, rng=rng)
         if prefix_data is None:
             logging.error("生成数据集失败，请清空picked ids")
-            exit(0)
+            sys.exit(1)
     else:
         prefix_data = [""] * prefix_num
 
@@ -334,10 +396,10 @@ def _create_prefix_dataset_variable(tokenizer_path, input_len, number, save_path
     max_suffix_len = max(rl - cl - 3 for rl, cl in zip(real_lens, common_lens))
     if max_suffix_len < 1:
         max_suffix_len = 1
-    suffix_pool = create_dataset(tokenizer_path, max_suffix_len, number, 0)
+    suffix_pool = create_dataset(tokenizer_path, max_suffix_len, number, 0, rng=rng)
     if suffix_pool is None:
         logging.error("生成后缀数据集失败，请清空picked ids")
-        exit(0)
+        sys.exit(1)
 
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
 

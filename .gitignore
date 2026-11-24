@@ -18,5 +18,17 @@ pd_metrics_live.txt
 # 数据集生成的状态文件（记录已使用的 GSM8K 题目，删除后重新生成数据集可选到新题）
 picked_ids.txt
 
-# 本地真实配置备份（含内网地址，勿提交）
+# 本地真实配置（含内网地址/权重路径，从 config_template_*.py 复制生成，勿提交）
+config.py
 config.py.local
+
+# 生成的数据集（README 示例 DATASET_PATH="./dataset"）
+dataset/
+*.jsonl
+!GSM8K.jsonl
+
+# 五阶段明细 CSV（写在 outputs/ 之外时也可能出现）
+kv_stage_details.csv
+
+# 原子写的中间文件
+*.tmp

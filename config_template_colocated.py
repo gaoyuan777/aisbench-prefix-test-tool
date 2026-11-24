@@ -32,7 +32,7 @@ OUTPUT_DIR = "./outputs/default"
 #   按部署形态填写（详见 README「DP 部署形态与 metrics 配置」）：
 #     单实例内部 DP（--data-parallel-size N --api-server-count 1）填服务地址本身即可；
 #     多 API server（--api-server-count N）或多实例部署时列出全部端口
-POD_INFO = ["192.168.1.10:8000"]
+POD_INFO = []   # 例: ["192.168.1.10:8000"]
 
 # ===== 运行时指标监控（可选）=====
 # 填 vLLM 引擎自身的 metrics 端口（不要填 proxy），测试期间每秒采集并生成 HTML 报告
@@ -43,7 +43,7 @@ POD_INFO = ["192.168.1.10:8000"]
 #     一个端口返回全部 DP 域数据（engine 标签区分），填 1 个地址即可
 #   多 API server（--api-server-count N）或多实例部署：
 #     每端口仅本 DP 域，逗号分隔列出全部端口
-M_LISTEN_SERVER = "192.168.1.10:8000"
+M_LISTEN_SERVER = ""   # 例: "192.168.1.10:8000"（vLLM 引擎端口，多端口逗号分隔）
 
 # 混部形态下以下两项留空（M_LISTEN_SERVER 优先级最高，填了 P/D 也不会生效）
 P_LISTEN_SERVER = ""

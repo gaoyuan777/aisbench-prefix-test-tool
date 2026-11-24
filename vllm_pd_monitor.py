@@ -46,7 +46,6 @@ PROGRESS_BAR_RE = re.compile(
     r"\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),(\d+)\] .*Starting progress bar"
 )
 SKIP_RESULT_KEYS = {"Prefix Cache Hit Rate", "Prefix Hit Rate", "prefix cache hit rate"}
-CARTESIAN_CELLS = ((1, 1), (1, 2), (2, 1), (2, 2), (3, 2))
 USAGE_METRICS = (
     "vllm:kv_cache_usage_perc",
     "vllm:gpu_cache_usage_perc",
@@ -260,6 +259,25 @@ def _pick_metric(samples: List[Dict[str, Any]], names: Iterable[str]) -> List[Di
     return [item for item in samples if item["name"] in wanted]
 
 
+def _sum_by_engine(items: List[Dict[str, Any]], names: Iterable[str]) -> Dict[str, float]:
+    """计数器类指标按 engine 累加，只取一个指标名家族。
+
+    同一 engine 可能暴露多条 series（如额外 model_name 标签），直接 dict 推导会相互覆盖导致漏计；
+    而 vllm 同时暴露 `prefix_cache_*_total` 与 `gpu_prefix_cache_*` 别名且数值相同，跨家族累加会翻倍。
+    因此按 names 给出的优先级，只对实际存在的第一个家族做累加。
+    """
+    for name in names:
+        family = [item for item in items if item["name"] == name]
+        if not family:
+            continue
+        totals: Dict[str, float] = {}
+        for item in family:
+            eid = _engine_id(item["labels"])
+            totals[eid] = totals.get(eid, 0.0) + float(item["value"])
+        return totals
+    return {}
+
+
 def _to_usage_percent(raw_values: List[float]) -> Optional[float]:
     if not raw_values:
         return None
@@ -300,9 +318,9 @@ def extract_runtime_metrics(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
             total_from_direct[engine] = item["value"]
             engine_blocks.setdefault(engine, item["value"])
 
-    usage_by_engine = {_engine_id(item["labels"]): item["value"] for item in usage_items}
-    hits_by_engine = {_engine_id(item["labels"]): item["value"] for item in hits_items}
-    queries_by_engine = {_engine_id(item["labels"]): item["value"] for item in queries_items}
+    usage_by_engine = {_engine_id(item["labels"]): item["value"] for item in usage_items}  # 仪表类：同 engine 取最后值
+    hits_by_engine = _sum_by_engine(hits_items, HITS_METRICS)  # 计数器类：同家族同 engine 多条 series 累加
+    queries_by_engine = _sum_by_engine(queries_items, QUERIES_METRICS)  # 计数器类：同家族同 engine 多条 series 累加
     running_by_engine = {_engine_id(item["labels"]): item["value"] for item in running_items}
     waiting_by_engine = {_engine_id(item["labels"]): item["value"] for item in waiting_items}
     swapped_by_engine = {_engine_id(item["labels"]): item["value"] for item in swapped_items}
@@ -387,12 +405,43 @@ def is_full_dataset_phase(phase: str) -> bool:
     return str(phase or "").startswith("full_dataset")
 
 
-def compute_prefix_deltas(hits, queries, base_hits, base_queries) -> Dict[str, Optional[float]]:
+_COUNTER_WARNED: set = set()
+
+
+def compute_prefix_deltas(
+    hits,
+    queries,
+    base_hits,
+    base_queries,
+    role: Optional[str] = None,
+    endpoint: Optional[str] = None,
+) -> Dict[str, Optional[float]]:
     if None in (hits, queries, base_hits, base_queries):
         return {"prefix_cache_hits_delta": None, "prefix_cache_queries_delta": None, "prefix_hit_rate": None}
     hits_delta = hits - base_hits
     queries_delta = queries - base_queries
-    hit_rate = (100.0 * hits_delta / queries_delta) if queries_delta > 0 else None
+    hit_rate: Optional[float] = None
+    warn_key = None
+    warn_msg = ""
+    if queries_delta < 0 or hits_delta < 0:
+        # 计数器回退（端点重启 / Prometheus 计数器重置）：命中率无效，保留原始差值
+        warn_key = f"reset:{role}:{endpoint}"
+        warn_msg = (
+            f"prefix 计数器回退，命中率置为 N/A (role={role}, endpoint={endpoint}): "
+            f"hits_delta={hits_delta}, queries_delta={queries_delta}"
+        )
+    elif hits_delta > queries_delta:
+        # 命中数大于查询数：计数器不一致，命中率无效
+        warn_key = f"inconsistent:{role}:{endpoint}"
+        warn_msg = (
+            f"prefix 计数器不一致，命中率置为 N/A (role={role}, endpoint={endpoint}): "
+            f"hits_delta={hits_delta} > queries_delta={queries_delta}"
+        )
+    elif queries_delta > 0:
+        hit_rate = 100.0 * hits_delta / queries_delta
+    if warn_key is not None and warn_key not in _COUNTER_WARNED:
+        _COUNTER_WARNED.add(warn_key)
+        logging.warning(warn_msg)
     return {
         "prefix_cache_hits_delta": hits_delta,
         "prefix_cache_queries_delta": queries_delta,
@@ -620,7 +669,7 @@ class PDMetricsMonitor:
                 self._end_ts = None
 
     def set_kv_stage_data(self, data: Optional[Dict[str, Any]]) -> None:
-        """注入 KVStageAnalyzer.build_bar_traces() 的结果，export 时生成图 11。"""
+        """注入 KVStageAnalyzer.build_bar_traces() 的结果，export 时生成图 3。"""
         self._kv_stage_data = data
 
     def remember_aisbench_plot(self, path: Optional[str], label: str = "") -> None:
@@ -747,6 +796,8 @@ class PDMetricsMonitor:
                         item.get("prefix_cache_queries"),
                         base.get("prefix_cache_hits"),
                         base.get("prefix_cache_queries"),
+                        role=item.get("role"),
+                        endpoint=item.get("endpoint"),
                     )
                 )
                 return item
@@ -1062,7 +1113,7 @@ def _layout_axis_title(layout: Dict[str, Any], axis_key: str, default: str) -> s
 
 def bin_queue_series(
     samples: List[Dict[str, Any]], role: str
-) -> Tuple[List[datetime], List[float], List[float], List[float], List[str], bool]:
+) -> Tuple[List[datetime], List[float], List[float], List[str]]:
     buckets: Dict[int, List[Dict[str, Any]]] = {}
     role_samples = []
     for sample in samples:
@@ -1487,35 +1538,23 @@ def _ordered_cartesian_axis_pairs(fig) -> List[Tuple[str, str]]:
     return pairs
 
 
-def _legend_style(x: float, y: float, xanchor: str, yanchor: str) -> dict:
-    return dict(
-        x=x,
-        y=y,
-        xanchor=xanchor,
-        yanchor=yanchor,
-        bgcolor="rgba(255,255,255,0.82)",
-        bordercolor="#d0d7de",
-        borderwidth=1,
-        font=dict(size=10),
-        itemsizing="constant",
-        itemwidth=30,
-        tracegroupgap=2,
-        orientation="v",
-    )
-
-
-def _legend_below_subplot(fig, xaxis_key: str, yaxis_key: str, x_frac: float = 0.5) -> dict:
+def _legend_below_subplot(fig, xaxis_key: str, yaxis_key: str, x_frac: float = 0.5,
+                          total_height: Optional[float] = None, y_pad_px: float = 18) -> dict:
     """图例垂直挂在子图正下方（图外、水平位置由 x_frac 控制，不挡 X 轴刻度标签）。
 
     x_frac=0.5 居中；per-DP 队列图双列图例时 Running 列用 0.28、Waiting 列用 0.72。
     每项独占一行（颜色标记 + 指标名 + max/min/avg 统计由调用方注入 trace.name），
     plotly 原生支持点击图例项切换对应数据线显隐。
+
+    偏移按像素换算（y_pad_px / total_height）而非固定 paper 比例：
+    固定比例在画布很高时会把最底行图例推出画布外。
     """
     x0, x1 = list(fig.layout[xaxis_key].domain or [0, 1])
     y0 = list(fig.layout[yaxis_key].domain or [0, 1])[0]
+    offset = (y_pad_px / total_height) if total_height else 0.018
     return dict(
         x=x0 + (x1 - x0) * x_frac,
-        y=y0 - 0.018,
+        y=y0 - offset,
         xanchor="center",
         yanchor="top",
         bgcolor="rgba(255,255,255,0)",
@@ -1557,43 +1596,6 @@ def _inject_trace_stats_name(fig, xaxis_key: str, skip: bool) -> None:
         mx, mn = max(numeric), min(numeric)
         avg = sum(numeric) / len(numeric)
         trace.name = f"{name}  max {mx:.2f} / min {mn:.2f} / avg {avg:.2f}"
-
-
-def _adaptive_legend_box(fig, xaxis_key: str, yaxis_key: str, ys: List[Any], prefer: str = "topright") -> dict:
-    domain_x = list(fig.layout[xaxis_key].domain or [0, 1])
-    domain_y = list(fig.layout[yaxis_key].domain or [0, 1])
-    x0, x1 = domain_x[0], domain_x[1]
-    y0, y1 = domain_y[0], domain_y[1]
-    numeric = []
-    for value in ys:
-        try:
-            if value is None:
-                continue
-            numeric.append(float(value))
-        except (TypeError, ValueError):
-            continue
-    corner = prefer
-    if numeric:
-        max_y = max(numeric) or 1.0
-        n = len(numeric)
-        right = numeric[int(n * 0.7) :] or numeric
-        left = numeric[: max(1, int(n * 0.3))]
-        right_busy = (sum(right) / len(right)) > 0.62 * max_y
-        left_busy = (sum(left) / len(left)) > 0.62 * max_y
-        if prefer == "topright" and right_busy and not left_busy:
-            corner = "topleft"
-        elif prefer == "topleft" and left_busy and not right_busy:
-            corner = "topright"
-        elif right_busy and left_busy:
-            corner = "bottomright"
-    frac = {
-        "topright": (0.98, 0.97, "right", "top"),
-        "topleft": (0.02, 0.97, "left", "top"),
-        "bottomright": (0.98, 0.06, "right", "bottom"),
-        "bottomleft": (0.02, 0.06, "left", "bottom"),
-    }[corner]
-    xf, yf, xanchor, yanchor = frac
-    return _legend_style(x0 + (x1 - x0) * xf, y0 + (y1 - y0) * yf, xanchor, yanchor)
 
 
 def _add_kv_lines(fig, samples: List[Dict[str, Any]], row: int, col: int, legend: str) -> None:
@@ -1736,12 +1738,14 @@ def _add_kv_lines_per_engine(fig, samples: List[Dict[str, Any]], row: int, col: 
                 continue
             xs.append(_to_dt(sample.get("timestamp")))
             raw = eng.get("kv_cache_usage_raw")
-            pct = float(raw) * 100.0 if raw is not None else 0.0
+            # 与 _to_usage_percent 同一单位启发式；缺失时置 None 由 plotly 断开（connectgaps=False），不画假 0%
+            pct = _to_usage_percent([float(raw)]) if raw is not None else None
             ys.append(pct)
+            pct_text = f"{pct:.2f}%" if pct is not None else "N/A"
             hover.append(
                 f"DP-{eid}<br>"
                 f"时间: {sample.get('timestamp')}<br>"
-                f"KV Cache 占用率: {pct:.2f}%"
+                f"KV Cache 占用率: {pct_text}"
             )
         color = DP_LINE_PALETTE[int(eid) % len(DP_LINE_PALETTE)]
         fig.add_trace(
@@ -1966,8 +1970,19 @@ def append_hit_rate_to_aisbench_json(perf_dir: str, summary: List[Dict[str, Any]
         for item in summary:
             rate = item.get("hit_rate")
             metric[hit_rate_stage_label(item, summary)] = f"{rate:.2f}%" if rate is not None else "N/A"
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, ensure_ascii=False, indent=2)
+        # 原子写入：先写同目录 .tmp 再 os.replace，避免中途崩溃损坏原始基准产物
+        tmp_path = path + ".tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, path)
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("写入命中率到 %s 失败，保留原文件: %s", path, exc)
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
 
 
 def write_metrics_html(
@@ -2013,7 +2028,7 @@ def write_metrics_html(
         has_kv_stage = bool(kv_stage_data)
         page_title = "vLLM PD 分离运行时指标与 ais_bench 请求图"
         if has_kv_stage:
-            # 新布局：图 11（五阶段时间线）提到图 3 位置；图 5 起左 P 右 D；结果表整行
+            # 新布局：图 3（五阶段时间线）提到图 3 位置；图 5 起左 P 右 D；结果表整行
             n_rows = 6
             table_row = 6
             table_col = 1
@@ -2041,9 +2056,11 @@ def write_metrics_html(
             prefers = ["topright", "topleft", "topright", "topleft", "topright",
                        "topright", "topright", "topright", "topright", "topright"]
         else:
-            n_rows = 5
-            table_row = 5
-            table_col = 2
+            # 无五阶段布局：图 9（D 各 DP 队列）独占整行，结果表另起整行，
+            # 避免结果表被挤在半幅宽度里换行过高而被裁切
+            n_rows = 6
+            table_row = 6
+            table_col = 1
             titles = [
                 "图1 请求时间轴（来自 gsm8k_plot）",
                 "图2 KV Cache 占用率随时间变化",
@@ -2056,17 +2073,61 @@ def write_metrics_html(
                 "图9 D 节点各 DP Running/Waiting 队列",
                 "图10 ais_bench 测试结果",
             ]
-            specs = [[{}, {}], [{}, {}], [{}, {}], [{}, {}], [{}, {"type": "table"}]]
+            specs = [[{}, {}], [{}, {}], [{}, {}], [{}, {}], [{"colspan": 2}, None],
+                     [{"type": "table", "colspan": 2}, None]]
             cartesian_cells = ((1, 1), (1, 2), (2, 1), (2, 2), (3, 1), (3, 2), (4, 1), (4, 2), (5, 1))
             legend_keys = ["legend", "legend2", "legend3", "legend4", "legend5", "legend6", "legend7", "legend8", "legend9"]
             prefers = ["topright", "topleft", "topright", "topright", "topright", "topright", "topright", "topright", "topright"]
+
+    # 结果表行数决定其所需高度：先加载结果表并按实际行数分配行高，
+    # 避免表格行被固定的等高行裁掉（此前表格底部会被画布截断）。
+    perf_dir = os.path.dirname(os.path.abspath(output_path))
+    csv_rows, json_rows = load_aisbench_result_tables(perf_dir)
+    table_trace = _build_result_table_trace(csv_rows, json_rows)
+    table_body_rows = 1
+    cells_spec = getattr(table_trace, "cells", None)
+    if cells_spec is not None and getattr(cells_spec, "values", None):
+        try:
+            table_body_rows = max(1, len(cells_spec.values[0]))
+        except (TypeError, IndexError):
+            table_body_rows = 1
+    # 表格像素高度：表头 28 + 每行约 26（字号 10 + 行内边距）+ 留白
+    table_px = 28 + table_body_rows * 26 + 36
+
+    # 图例行高：每个图例最多 dp 项（每 DP 一条），项数多时图例会很高，
+    # 行间距与底部留白都必须按图例实际高度预留，否则图例会压到下一行图（图内容重叠）。
+    dp_est = 1
+    for sample in samples:
+        eng = sample.get("engines") or {}
+        if isinstance(eng, dict) and len(eng) > dp_est:
+            dp_est = len(eng)
+    # 每项预留 18px（字号 10 的实际项高 + 余量），再加 28px 内边距，避免估算偏低导致压图
+    legend_h_px = dp_est * 18 + 28
+
+    # 行间空白：上一行图例高度 + 18px 贴图间距 + 下一行图标题带（约 40px）+ 安全余量
+    VS_GAP_PX = max(120, legend_h_px + 70)
+    margin_t = 92
+    margin_b = max(48, legend_h_px + 24)    # 底部留白：容纳最底行图例
+    # 图表行固定像素高度（结果表单独按内容分配高度，避免表格行被裁切）
+    chart_px = 300 if colocated else (220 if kv_stage_data else 240)
+    table_px = max(chart_px, table_px)
+    row_heights = [chart_px] * (n_rows - 1) + [table_px]
+    # 由行高/间距/表高等反推画布高度，并把 vertical_spacing 换成等效比例，
+    # 使像素布局可预测（plotly 的 spacing 是绘图区比例）
+    avail_px = sum(row_heights) + VS_GAP_PX * (n_rows - 1)
+    VS = VS_GAP_PX / avail_px
+    # plotly 要求 vertical_spacing < 1/(rows-0.5)，否则 make_subplots 抛 ValueError；
+    # 极端大 dp 时 clamp 兜底（此时行内空间不可能同时容纳标题+图例，仅保证不崩）
+    VS = min(VS, 0.9 / (n_rows - 0.5))
+    fig_height = avail_px + margin_t + margin_b
 
     fig = make_subplots(
         rows=n_rows,
         cols=2,
         subplot_titles=titles,
-        vertical_spacing=0.11,
+        vertical_spacing=VS,
         horizontal_spacing=0.08,
+        row_heights=row_heights,
         specs=specs,
     )
 
@@ -2142,9 +2203,7 @@ def write_metrics_html(
         _add_queue_bars_per_engine(fig, samples, role="D", row=5, col=1, legend="legend9", legend_wait="legend11")
     _add_phase_bands(fig, phases, stopped_at, list(cartesian_cells))
 
-    perf_dir = os.path.dirname(os.path.abspath(output_path))
-    csv_rows, json_rows = load_aisbench_result_tables(perf_dir)
-    fig.add_trace(_build_result_table_trace(csv_rows, json_rows), row=table_row, col=table_col)
+    fig.add_trace(table_trace, row=table_row, col=table_col)
 
     for row, col in cartesian_cells[1:]:
         fig.update_xaxes(type="date", tickformat="%H:%M:%S", row=row, col=col)
@@ -2175,16 +2234,24 @@ def write_metrics_html(
                 ys.extend(list(trace.y))
         _inject_trace_stats_name(fig, xk, skip=(_row, _col) in skip_stats_cells)
         legend_layout[legend_key] = _legend_below_subplot(
-            fig, xk, yk, x_frac=0.28 if legend_key in wait_legend_of else 0.5
+            fig, xk, yk, x_frac=0.28 if legend_key in wait_legend_of else 0.5,
+            total_height=fig_height,
         )
     # Waiting 列图例（右列），与主图例同一子图下方
     for main_lg, wait_lg in wait_legend_of.items():
         if wait_lg in legend_layout:
             continue
-        tr = next(t for t in fig.data if str(getattr(t, "legend", "")) == wait_lg)
+        tr = next((t for t in fig.data if str(getattr(t, "legend", "")) == wait_lg), None)
+        if tr is None:
+            logging.warning(
+                "未找到 %s（主图例 %s）的 waiting 图例 trace，可能对应角色无引擎数据，跳过该图例定位",
+                wait_lg,
+                main_lg,
+            )
+            continue
         xk = "xaxis" if tr.xaxis in (None, "x") else f"xaxis{tr.xaxis[1:]}"
         yk = "yaxis" if tr.yaxis in (None, "y") else f"yaxis{tr.yaxis[1:]}"
-        legend_layout[wait_lg] = _legend_below_subplot(fig, xk, yk, x_frac=0.72)
+        legend_layout[wait_lg] = _legend_below_subplot(fig, xk, yk, x_frac=0.72, total_height=fig_height)
 
     hit_line = format_hit_rate_parenthetical(hit_rate_summary)
     fig.update_layout(
@@ -2197,7 +2264,7 @@ def write_metrics_html(
             xanchor="center",
             font=dict(size=22, color="#1a1a1a"),
         ),
-        height=1950 if colocated else (2880 if kv_stage_data else 2400),
+        height=fig_height,
         width=1680,
         plot_bgcolor="white",
         paper_bgcolor="white",
@@ -2205,13 +2272,17 @@ def write_metrics_html(
         bargap=0.15,
         hovermode="closest",
         dragmode="zoom",
-        margin=dict(l=70, r=36, t=92, b=48),
+        margin=dict(l=70, r=36, t=92, b=margin_b),
         **legend_layout,
     )
     for anno in fig.layout.annotations or []:
         text = str(anno.text or "")
         if text.startswith("图"):
             anno.font = dict(size=13, color="#222222")
+        # 结果表占据了整个子图区域，子图标题默认贴住表格表头，会被表头边框穿过；
+        # 仅对结果表标题上移几像素，保持与表头分离
+        if text.strip() == titles[-1].strip():
+            anno.yshift = 14
 
     fig.write_html(
         output_path,

@@ -36,7 +36,7 @@ _KV_XFER_RE = re.compile(
 _KV_XFER_FAIL_RE = re.compile(r"KV_XFER_FAIL")
 _FIELD_RE = re.compile(r"(\w+)=(\S+)")
 
-# 五阶段：顺序 = 图 11 堆叠自下而上
+# 五阶段：顺序 = 图 3 堆叠自下而上
 STAGE_KEYS = ("p_waiting", "p_running", "kv_transfer", "d_waiting", "d_running")
 STAGE_LABELS = {
     "p_waiting": "P 等待",
@@ -52,7 +52,7 @@ STAGE_COLORS = {
     "d_waiting": "#cbd5e1",
     "d_running": "#22c55e",
 }
-# 图 11 显示上限（超过时均匀降采样，统计与 CSV 始终全量）
+# 图 3 显示上限（超过时均匀降采样，统计与 CSV 始终全量）
 MAX_PLOT_REQUESTS = 2000
 
 
@@ -69,7 +69,10 @@ def _percentile(sorted_values: List[float], pct: float) -> Optional[float]:
 
 
 def _read_from_offset(path: str, offset: int) -> Tuple[str, int]:
-    """从 offset 读到 EOF；文件变小（轮转）→ 全量重读并告警。"""
+    """从 offset 读新增段（二进制模式，按完整行推进 offset）；文件变小（轮转）→ 全量重读并告警。
+
+    仅消费到最后一个完整换行，末尾半行留待下次读取，避免增量时把未写完的行切成两段而永久丢行。
+    """
     size = os.path.getsize(path)
     if size < offset:
         logging.warning(
@@ -77,10 +80,18 @@ def _read_from_offset(path: str, offset: int) -> Tuple[str, int]:
             path, size, offset,
         )
         offset = 0
-    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+    if size <= offset:
+        return "", offset
+    with open(path, "rb") as fh:
         fh.seek(offset)
-        text = fh.read()
-    return text, size
+        chunk = fh.read()
+    # 只推进到最后一个完整换行（换行为 ASCII 边界，在其后解码可安全跨多字节字符）
+    last_nl = chunk.rfind(b"\n")
+    if last_nl < 0:
+        return "", offset
+    complete = chunk[: last_nl + 1]
+    text = complete.decode("utf-8", errors="replace")
+    return text, offset + len(complete)
 
 
 class KVStageAnalyzer:
@@ -93,7 +104,7 @@ class KVStageAnalyzer:
             ... 压测 ...
             analyzer.collect()        # 每轮 full_dataset 结束后（增量，自动衔接）
             analyzer.summary()        # 统计
-            analyzer.build_bar_traces()  # 图 11 数据
+            analyzer.build_bar_traces()  # 图 3 数据
     """
 
     def __init__(self, log_p: str = "", log_d: str = ""):
@@ -105,6 +116,19 @@ class KVStageAnalyzer:
         self._started = False
         self._read_p = 0
         self._read_d = 0
+        # D 先到、P 缺失的记录（request_id → record），等 P 行后续到达时回填
+        self._pending_p: Dict[str, Dict[str, Any]] = {}
+        # 补丁/格式诊断用一次性标志与累计计数
+        self._stage_rows_total = 0
+        self._warned_no_patch = False
+        self._parse_err_logged = False
+
+    def _note_parse_error(self, line: str) -> None:
+        """计数格式异常行；仅首次告警并给出样本（截断 200 字符），便于定位格式漂移。"""
+        self.parse_errors += 1
+        if not self._parse_err_logged:
+            self._parse_err_logged = True
+            logging.warning("[kv_stage] 检测到格式异常行（同类后续仅计数）：%s", line.strip()[:200])
 
     # ---------- 初始化 ----------
 
@@ -121,6 +145,11 @@ class KVStageAnalyzer:
         analyzer = cls(log_p, log_d)
         if analyzer.enabled:
             logging.info("[kv_stage] PD 请求五阶段耗时分析已启用: P=%s D=%s", log_p, log_d)
+        elif log_p or log_d:
+            logging.warning(
+                "[kv_stage] KV_STAGE_LOG_P / KV_STAGE_LOG_D 需同时填写才启用五阶段分析，当前仅填一个（P=%r D=%r），功能禁用",
+                log_p, log_d,
+            )
         return analyzer
 
     def start(self) -> None:
@@ -185,7 +214,7 @@ class KVStageAnalyzer:
                         row[key] = float(fields[name])
                 rows.append(row)
             except (TypeError, ValueError):
-                self.parse_errors += 1
+                self._note_parse_error(line)
         return rows
 
     def _parse_worker_lines(self, text: str) -> Dict[str, Dict[str, Any]]:
@@ -202,7 +231,7 @@ class KVStageAnalyzer:
                 bytes_ = int(match.group(3))
                 device_id = int(match.group(6))
             except (TypeError, ValueError):
-                self.parse_errors += 1
+                self._note_parse_error(line)
                 continue
             item = agg.setdefault(
                 request_id,
@@ -246,6 +275,17 @@ class KVStageAnalyzer:
         expected_workers = self._most_common_worker_count(workers)
 
         p_by_id = {row["request_id"]: row for row in p_rows}
+        # 事件回填：本轮到达的 P 行若命中此前"D 先到、P 缺失"的 pending 记录，则补齐 P 侧数据
+        # （保持记录对象不变，phase/seq 原样保留）
+        for rid, p_row in p_by_id.items():
+            rec = self._pending_p.get(rid)
+            if rec is None:
+                continue
+            rec["p_waiting"] = p_row.get("p_waiting")
+            rec["p_running"] = p_row.get("p_running")
+            rec["t_p_end"] = p_row.get("ts")
+            rec["missing_p"] = False
+            del self._pending_p[rid]
         # D 行 = 请求完成点，以 D 为主序
         known = {rec["request_id"] for rec in self.records}
         new_records = []
@@ -280,12 +320,24 @@ class KVStageAnalyzer:
             else:
                 rec["kv_wait_overhead"] = None
             new_records.append(rec)
+            known.add(rid)  # 批内去重：同批次后续重复 id 不再生成记录
+            if rec["missing_p"]:
+                self._pending_p[rid] = rec  # 待后续 P 行回填
 
         # P 侧有而 D 侧缺失的请求（请求未完成/失败）：仅告警计数，不生成记录
         missing_d = [rid for rid in p_by_id if rid not in {r["request_id"] for r in d_rows}]
         self.records.extend(new_records)
         self._xfer_fail_total = getattr(self, "_xfer_fail_total", 0) + fail_total
         self._expected_workers = expected_workers
+        # 补丁缺失诊断：确有新日志被消费却一条 REQ_STAGE_METRIC 都没解析到 → 提示 vllm 侧未带补丁
+        self._stage_rows_total += len(p_rows) + len(d_rows)
+        if (text_p or text_d) and self._stage_rows_total == 0 and not self._warned_no_patch:
+            self._warned_no_patch = True
+            logging.warning(
+                "[kv_stage] 日志中未发现任何 REQ_STAGE_METRIC 行，五阶段数据将为空："
+                "vLLM 侧需携带 PR #62685 补丁（P=%s D=%s）",
+                self.log_p, self.log_d,
+            )
         logging.info(
             "[kv_stage] collect: 本轮新增 %d 条（P 行 %d / D 行 %d / worker 明细 %d 个请求，P 缺失 %d / D 缺失 %d）",
             len(new_records), len(p_rows), len(d_rows), len(workers),
@@ -403,19 +455,23 @@ class KVStageAnalyzer:
 
     def summary(self) -> Dict[str, Any]:
         all_full = [r for r in self.records if self._is_full_phase(r.get("phase"))]
-        records = [r for r in all_full if not r["missing_p"]]
+        joined = [r for r in all_full if not r["missing_p"]]
         result: Dict[str, Any] = {
             "count_total": len(all_full),
-            "count_joined": len(records),
+            "count_joined": len(joined),
             "count_warmup": len(self.records) - len(all_full),
             "missing_p": sum(1 for r in all_full if r["missing_p"]),
             "xfer_fail_total": getattr(self, "_xfer_fail_total", 0),
             "expected_workers": getattr(self, "_expected_workers", 0),
             "stages": {},
         }
+        # P 阶段仅用 P/D 已 join 的记录；D/KV 阶段仅在记录带 D 数据时统计（D 侧数据本身有效，
+        # 不因 P 缺失被剔除，避免静默低估 kv_transfer/d_waiting/d_running）
+        p_stage_keys = {"p_waiting", "p_running"}
         total_sums: Dict[str, float] = {}
         for key in STAGE_KEYS:
-            values = sorted(r[key] for r in records if r.get(key) is not None)
+            pool = joined if key in p_stage_keys else all_full
+            values = sorted(r[key] for r in pool if r.get(key) is not None)
             if not values:
                 continue
             total_sums[key] = sum(values)
@@ -430,9 +486,9 @@ class KVStageAnalyzer:
         grand = sum(total_sums.values())
         for key, info in result["stages"].items():
             info["share"] = (info["sum"] / grand) if grand > 0 else 0.0
-        # KV 等待分解
-        overhead = sorted(r["kv_wait_overhead"] for r in records if r.get("kv_wait_overhead") is not None)
-        pure = sorted(r["kv_elapsed_ms_max"] / 1000.0 for r in records if r.get("kv_elapsed_ms_max") is not None)
+        # KV 等待分解（D/KV 侧数据，用全部 D 记录口径）
+        overhead = sorted(r["kv_wait_overhead"] for r in all_full if r.get("kv_wait_overhead") is not None)
+        pure = sorted(r["kv_elapsed_ms_max"] / 1000.0 for r in all_full if r.get("kv_elapsed_ms_max") is not None)
         if overhead:
             result["kv_wait_overhead"] = {
                 "avg": sum(overhead) / len(overhead),
@@ -525,10 +581,10 @@ class KVStageAnalyzer:
         logging.info("[kv_stage] 请求明细已保存: %s", path)
         return path
 
-    # ---------- 图 11 数据 ----------
+    # ---------- 图 3 数据 ----------
 
     def build_bar_traces(self) -> Optional[Dict[str, Any]]:
-        """构造图 11 水平分段时间线数据（绝对时间轴版，与全图 X 轴联动）。
+        """构造图 3 水平分段时间线数据（绝对时间轴版，与全图 X 轴联动）。
 
         Y 轴 = 请求编号（完成顺序）；X 轴 = 绝对时间（date 轴，与图 1-9 联动框选）。
         各阶段起止由日志时间戳锚定反推（P 行时间戳 = P 完成锚点，D 行时间戳 = D 完成锚点）：

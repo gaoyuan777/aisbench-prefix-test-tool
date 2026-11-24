@@ -3,12 +3,14 @@ import sys
 import argparse
 import re
 import logging
+import shlex
+import signal
 import subprocess
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from config import *
 from generate_dataset import *
-from save_file import get_data, save_csv, save_log
+from save_file import get_data, save_csv, save_log, merge_extra_metrics_into_csv
 from cal_prefix_hit_rate import *
 from kv_stage_analyzer import KVStageAnalyzer
 from vllm_pd_monitor import (
@@ -19,7 +21,6 @@ from vllm_pd_monitor import (
     find_aisbench_plot_html,
     plot_label_from_phase,
 )
-logging.getLogger().setLevel(logging.INFO)
 
 # warmup 阶段固定使用的统计口径：数据量仅 prefix_num*dp*2 条且 output_len=1，
 # 无法形成稳态窗口（stable_stage 会报 Can not find a stable stage 并中止），必须用全量口径
@@ -33,21 +34,97 @@ api_test_abbr = "vllm-api-stream-chat"
 request_rate = "0"
 dp = 1
 
+# config 模板占位符：仍为这些字符串说明用户未修改 config.py
+_TEMPLATE_PLACEHOLDERS = ["/path/to", "your-model-name", "141.xx.xx.xx", "192.168.1.10"]
+
+
+def _check_config_placeholder(name, value):
+    """启动前快速校验 config 项是否仍为模板占位符，命中则致命退出（不发网络请求）。"""
+    for placeholder in _TEMPLATE_PLACEHOLDERS:
+        if placeholder in str(value):
+            logging.error(f"配置项 {name} 仍是模板占位符（含 '{placeholder}'）：{value}，请修改 config.py")
+            sys.exit(1)
+
+
+def _validate_cli_args(parser, args):
+    """解析后立即校验数值与参数组合，非法时以清晰的错误信息退出。"""
+    if args.input_len < 1:
+        parser.error("--input_len 必须 >= 1")
+    if args.output_len < 1:
+        parser.error("--output_len 必须 >= 1")
+    if args.data_num < 1:
+        parser.error("--data_num 必须 >= 1")
+    if args.concurrency < 1:
+        parser.error("--concurrency 必须 >= 1")
+    if args.npu_num < 1:
+        parser.error("--npu_num 必须 >= 1")
+    if args.dp < 1:
+        parser.error("--dp 必须 >= 1")
+    if args.prefix_num < 1:
+        parser.error("--prefix_num 必须 >= 1")
+    if args.repeat < 1:
+        parser.error("--repeat 必须 >= 1")
+    if args.seed < 0:
+        parser.error("--seed 必须 >= 0")
+
+    # request_rate 保持 str（兼容 "0"/"10" 等），但必须是数字且 >= 0
+    try:
+        request_rate_value = float(args.request_rate)
+    except (TypeError, ValueError):
+        parser.error(f"--request_rate 必须是数字，收到: {args.request_rate}")
+    if request_rate_value < 0:
+        parser.error("--request_rate 必须 >= 0")
+
+    # repeat_rate 支持 "50%" 或 "0.5"，必须是 [0,1] 内数字
+    try:
+        repeat_rate_value = parse_prefix_ratio(args.repeat_rate)
+    except (TypeError, ValueError) as exc:
+        parser.error(f"--repeat_rate 非法: {exc}")
+
+    # prefix_test 仅在 prefix_cache 形态下生效
+    if args.prefix_test and args.dataset_type != "prefix_cache":
+        logging.warning("--prefix_test 仅在 --dataset_type prefix_cache 时生效，当前已忽略")
+
+    # --repeat 的多轮循环只存在于普通数据集分支，prefix_cache 会忽略该参数
+    if args.dataset_type == "prefix_cache" and args.repeat > 1:
+        logging.warning("--repeat 仅在 --dataset_type normal 时生效，prefix_cache 模式将忽略该参数（只跑一轮）")
+
+    # accuracy 模式不写 perf 日志，多轮循环拿不到指标，直接拒绝以免产出误导数据
+    if args.test_accuracy and args.repeat > 1:
+        parser.error("--test_accuracy 与 --repeat>1 暂不兼容：精度测试无性能日志，无法按轮落盘；请去掉 --repeat")
+
+    # prefix_cache + prefix_test 需要工具生成的前缀数据集，不能同时指定外部 --dataset
+    if args.dataset_type == "prefix_cache" and args.prefix_test and args.dataset != "none":
+        parser.error(
+            "--dataset_type prefix_cache 与 --prefix_test 不能同时指定 --dataset："
+            "预热需要由工具生成的公共前缀数据集，请省略 --dataset 或去掉 --prefix_test"
+        )
+
+    # 前缀预算：repeat_rate<1 时前缀后还需 3 个唯一 token，剩余长度必须为正
+    if args.dataset_type == "prefix_cache" and repeat_rate_value < 1:
+        prefix_len = int(args.input_len * repeat_rate_value)
+        if args.input_len <= prefix_len + 3:
+            parser.error(
+                f"--input_len={args.input_len} 相对 --repeat_rate={args.repeat_rate} 过小："
+                f"前缀占用 {prefix_len} 个 token，还要 3 个唯一 token，剩余长度需 >= 1；"
+                f"请增大 --input_len 或减小 --repeat_rate"
+            )
+
 
 def parse_arguments():
     parser = argparse.ArgumentParser()
     parser.add_argument('--input_len', type=int, default=3500, help="input token length")
-    parser.add_argument("--output_len", type=str, default="1500", help="output token length")
+    parser.add_argument("--output_len", type=int, default=1500, help="output token length")
     parser.add_argument("--data_num", type=int, default=8192, help="dataset number")
-    parser.add_argument("--concurrency", type=str, default="2048", help="max concurrency")
+    parser.add_argument("--concurrency", type=int, default=2048, help="max concurrency")
     parser.add_argument("--request_rate", type=str, default="0", help="request rate")
-    parser.add_argument("--test_type", type=str, default="stream", help="text or stream")
+    parser.add_argument("--test_type", type=str, default="stream", choices=["text", "stream"], help="text or stream")
     parser.add_argument("--dataset", type=str, default="none", help="dataset path")
     parser.add_argument("--repeat", type=int, default=1, help="number of test repeat times")
     parser.add_argument("--enable_think", action='store_true', default=False, help="enable thinking for ds v3.1")
     parser.add_argument("--test_accuracy", action='store_true', default=False, help="test accuracy")
     parser.add_argument("--npu_num", type=int, default=1, help="npu numbers")
-    parser.add_argument("--dataset_type", type=str, default="normal", help="normal or prefix_cache")
+    parser.add_argument("--dataset_type", type=str, default="normal", choices=["normal", "prefix_cache"], help="normal or prefix_cache")
     parser.add_argument("--prefix_num", type=int, default=1, help="prefix numbers")
     parser.add_argument("--repeat_rate", type=str, default="0", help="dataset repeat rate")
     parser.add_argument("--prefix_test", action='store_true', default=False, help="test prefix dataset firstly")
@@ -58,7 +135,10 @@ def parse_arguments():
     parser.add_argument("--length_min", type=int, default=None, help="min length for uniform range or gaussian clip")
     parser.add_argument("--length_max", type=int, default=None, help="max length for uniform range or gaussian clip")
     parser.add_argument("--output_dir", type=str, default=None, help="aisbench output directory, overrides config OUTPUT_DIR if provided")
-    return parser.parse_args()
+    parser.add_argument("--timeout", type=float, default=None, help="单阶段 ais_bench 子进程超时秒数，默认 None 表示不限制")
+    args = parser.parse_args()
+    _validate_cli_args(parser, args)
+    return args
 
 def symlink_force(target, link_name):
     logging.info(f"make symlink: {link_name} ==> {target}")
@@ -78,7 +158,6 @@ def create_gsm8k_dataset(dataset_type, input_len, data_num, model_path, dataset_
         os.makedirs(dataset_path, exist_ok=True)
         logging.info(f"dataset work path {dataset_path} created.")
 
-    base_name = os.path.basename(os.path.normpath(model_path))
     if dataset_type == "prefix_cache":
         prefix_jsonl_path, dataset_jsonl_path = create_multi_prefix_dataset(model_path,input_len,data_num,dataset_path,1,dp,repeat_rate,seed,prefix_num,
                                                                              length_mean, length_std, length_min, length_max)
@@ -94,9 +173,13 @@ def create_gsm8k_dataset(dataset_type, input_len, data_num, model_path, dataset_
         else:
             logging.info("  length_dist=fixed")
     else:
-        dataset_name = "GSM8K-in" + str(input_len) + "-num" + str(data_num) + "-" + base_name + ".jsonl"
+        # 使用与 create_multi_prefix_dataset 完全一致的命名逻辑（含变长数据集），
+        # 避免定长硬编码名字导致变长数据集永远找不到、并误用同名的陈旧文件
+        dataset_jsonl_path = expected_dataset_path(
+            model_path, input_len, data_num, dataset_path, 0, 0,
+            length_mean, length_std, length_min, length_max)
+        dataset_name = os.path.basename(dataset_jsonl_path)
         logging.info(f"dataset_name: {dataset_name}")
-        dataset_jsonl_path = os.path.join(dataset_path, dataset_name)
         prefix_jsonl_path = ""
         # 判断数据集是否存在
         if not os.path.exists(dataset_jsonl_path):
@@ -110,10 +193,13 @@ def create_gsm8k_dataset(dataset_type, input_len, data_num, model_path, dataset_
     return prefix_jsonl_path, dataset_jsonl_path
 
 def generate_aisbench_command(summarizer):
+    # 对 shell 插值参数做转义，避免路径含空格或注入
+    work_dir = shlex.quote(str(OUTPUT_DIR))
+    summarizer_arg = shlex.quote(str(summarizer))
     if test_accuracy:
-        ais_bench_cmd = f"ais_bench --models vllm_api_chat_temp --datasets gsm8k_gen_0_shot_cot_str_perf --work-dir {OUTPUT_DIR} --dump-eval-details"
+        ais_bench_cmd = f"ais_bench --models vllm_api_chat_temp --datasets gsm8k_gen_0_shot_cot_str_perf --work-dir {work_dir} --dump-eval-details"
     else:
-        ais_bench_cmd = f"ais_bench --models vllm_api_chat_temp --datasets gsm8k_gen_0_shot_cot_str_perf --mode perf --summarizer {summarizer} --work-dir {OUTPUT_DIR} --debug --num-warmups 0 2>&1 | tee -a aisbench.log | tee -a aisbench_all.log"
+        ais_bench_cmd = f"ais_bench --models vllm_api_chat_temp --datasets gsm8k_gen_0_shot_cot_str_perf --mode perf --summarizer {summarizer_arg} --work-dir {work_dir} --debug --num-warmups 0 2>&1 | tee -a aisbench.log | tee -a aisbench_all.log"
     return ais_bench_cmd
 
 def generate_test_dataset(src_file, dst_dir):
@@ -124,60 +210,75 @@ def generate_test_dataset(src_file, dst_dir):
     symlink_force(src_file, dst_file)
     return
 
-def save_result(request_rate, npu_num, extra_metrics=None, summarizer="default_perf"):
+def save_result(request_rate, npu_num, extra_metrics=None, summarizer="default_perf", round_index=None):
     aisbench_log_dir = "aisbench.log"
     filename = "aisbench_result.csv"
     ans, log_dir=get_data(aisbench_log_dir,request_rate,npu_num)
     if extra_metrics:
         ans.update(extra_metrics)
     ans["summarizer"] = summarizer
+    if round_index is not None:
+        ans["round"] = round_index
     save_log(aisbench_log_dir, log_dir)
-    save_csv(ans, filename)
+    if not save_csv(ans, filename):
+        logging.error(f"结果写入 {filename} 失败（详见上方错误），本次数据未落盘")
 
 def modify_aisbench_api(concurrency, output_len, request_rate_param=None):
     if request_rate_param is None:
         request_rate_param = request_rate
-    file_default = open("default_api.py", 'r+')
-    file_temp = open("temp_api.py", 'w+')
+    if test_accuracy:
+        generation_kwargs = "temperature=0.6,\n\t\t\ttop_p = 0.95"
+    else:
+        generation_kwargs = "temperature=0,\n\t\t\tignore_eos=True"
+    if enable_think:
+        generation_kwargs = generation_kwargs + ",\n\t\t\tchat_template_kwargs={\"enable_thinking\": True}"
+    generation_kwargs = generation_kwargs.expandtabs(4)
+    # 按原顺序做字面替换；用 lambda 保证含反斜杠/正则转义的值原样写入
+    replacements = [
+        ("model_path_for_replace", MODEL_PATH),
+        ("model_name_for_replace", MODEL_NAME),
+        ("api_key_for_replace", API_KEY),
+        ("rr_for_replace", request_rate_param),
+        ("test_type_for_replace", api_test_type),
+        ("test_abbr_for_replace", api_test_abbr),
+        ("ip_for_replace", HOST_IP),
+        ("port_for_replace", HOST_PORT),
+        ("outputlen_for_replace", output_len),
+        ("concurrency_for_replace", concurrency),
+        ("generation_kwargs_for_replace", generation_kwargs),
+    ]
     logging.info("Api config file:")
-    for ss in file_default.readlines():
-        tt = re.sub("model_path_for_replace", MODEL_PATH, ss)
-        tt = re.sub("model_name_for_replace", MODEL_NAME, tt)
-        tt = re.sub("api_key_for_replace", API_KEY, tt)
-        tt = re.sub("rr_for_replace", request_rate_param, tt)
-        tt = re.sub("test_type_for_replace", api_test_type, tt)
-        tt = re.sub("test_abbr_for_replace", api_test_abbr, tt)
-        tt = re.sub("ip_for_replace", HOST_IP, tt)
-        tt = re.sub("port_for_replace", HOST_PORT, tt)
-        tt = re.sub("outputlen_for_replace", output_len, tt)
-        tt = re.sub("concurrency_for_replace", concurrency, tt)
-        if test_accuracy:
-            generation_kwargs = "temperature=0.6,\n\t\t\ttop_p = 0.95"
-        else:
-            generation_kwargs = "temperature=0,\n\t\t\tignore_eos=True"
-        if enable_think:
-            generation_kwargs = generation_kwargs + ",\n\t\t\tchat_template_kwargs={\"enable_thinking\": True}"
-        tt = re.sub("generation_kwargs_for_replace", generation_kwargs.expandtabs(4), tt)
-        print(tt, end='')
-        file_temp.write(tt)
-    file_default.close()
-    file_temp.close()
+    with open("default_api.py", 'r') as file_default, open("temp_api.py", 'w') as file_temp:
+        for ss in file_default:
+            tt = ss
+            for token, value in replacements:
+                tt = re.sub(token, lambda m, v=str(value): v, tt)
+            logging.debug(tt)
+            file_temp.write(tt)
     symlink_force(
         os.path.join(os.getcwd(), "temp_api.py"),
         os.path.join(WORK_PATH, "ais_bench/benchmark/configs/models/vllm_api/vllm_api_chat_temp.py")
     )
 
-def _fetch_pod_metrics(pod):
-    if pod.startswith('['):
-        # IPv6 格式: [ip]:port
-        ip = pod.split(']:')[0][1:]
-        port = pod.split(']:')[1]
-    elif pod.count(':') > 1:
-        # IPv6 格式无方括号: ip:port
-        ip, port = pod.rsplit(':', 1)
+def parse_endpoint(pod):
+    """解析 ip:port（含 [ipv6]:port 与无括号 ipv6:port），非法格式抛 ValueError。"""
+    text = str(pod).strip()
+    if text.startswith('['):
+        end = text.find(']')
+        if end == -1 or not text[end + 1:].startswith(':'):
+            raise ValueError(f"POD_INFO 条目格式应为 ip:port，收到: {pod}")
+        ip = text[1:end]
+        port = text[end + 2:]
     else:
-        # IPv4 格式: ip:port
-        ip, port = pod.split(":")
+        if ':' not in text:
+            raise ValueError(f"POD_INFO 条目格式应为 ip:port，收到: {pod}")
+        ip, port = text.rsplit(':', 1)
+    if not ip or not port:
+        raise ValueError(f"POD_INFO 条目格式应为 ip:port，收到: {pod}")
+    return ip, port
+
+def _fetch_pod_metrics(pod):
+    ip, port = parse_endpoint(pod)
     query_token, query_external = get_prefix_queries_total(ip, port)
     hit_token, hit_external = get_prefix_hits_total(ip, port)
     return pod, query_token, query_external, hit_token, hit_external
@@ -187,7 +288,11 @@ def get_pod_metrics_info(pod_info):
     with ThreadPoolExecutor(max_workers=len(pod_info)) as executor:
         futures = [executor.submit(_fetch_pod_metrics, pod) for pod in pod_info]
         for future in as_completed(futures):
-            pod, q_n, q_e, h_n, h_e = future.result()
+            try:
+                pod, q_n, q_e, h_n, h_e = future.result()
+            except Exception as error:
+                logging.warning(f"获取 POD 指标失败，跳过该 POD: {error}")
+                continue
             query_tokens[pod] = q_n
             query_tokens_external[pod] = q_e
             hit_tokens[pod] = h_n
@@ -208,9 +313,20 @@ def cal_prefix_hit_info(query_tokens, query_tokens_external, hit_tokens, hit_tok
               f"{headers[2]:<{hbm_detail_width}}{headers[3]:<{external_rate_width}}{headers[4]}")
 
     def format_rate(hits, queries):
-        return "0.00%" if queries == 0 else format(hits / queries, ".2%")
+        # 计数器重置/引擎重启会出现负增量，queries==0 时命中率无定义，统一显示 N/A
+        if queries <= 0 or hits < 0 or hits > queries:
+            return "N/A"
+        return format(hits / queries, ".2%")
+
+    neg_warned_scopes = set()
 
     def build_row(scope, hbm_hits, hbm_queries, external_hits, external_queries):
+        if (hbm_hits < 0 or external_hits < 0) and scope not in neg_warned_scopes:
+            neg_warned_scopes.add(scope)
+            logging.warning(
+                f"检测到负的命中增量（计数器重置或引擎重启？） scope={scope}: "
+                f"hbm hits delta={hbm_hits}, external hits delta={external_hits}"
+            )
         return (f"{scope:<{scope_width}}{format_rate(hbm_hits, hbm_queries):<{hbm_rate_width}}"
                 f"{f'{hbm_hits}/{hbm_queries}':<{hbm_detail_width}}"
                 f"{format_rate(external_hits, external_queries):<{external_rate_width}}"
@@ -348,10 +464,11 @@ if __name__ == '__main__':
     length_std = args.length_std
     length_min = args.length_min
     length_max = args.length_max
+    timeout = args.timeout
 
-    # 命令行 --output_dir 覆盖 config.py 中的 OUTPUT_DIR
+    # 命令行 --output_dir 覆盖 config.py 中的 OUTPUT_DIR（规范化为绝对路径）
     if args.output_dir:
-        OUTPUT_DIR = args.output_dir
+        OUTPUT_DIR = os.path.abspath(args.output_dir)
         logging.info(f"OUTPUT_DIR overridden by CLI: {OUTPUT_DIR}")
 
     # 初始化日志文件：清空 aisbench.log（新运行覆盖），aisbench_all.log 添加分隔符（续写）
@@ -366,6 +483,32 @@ if __name__ == '__main__':
     setup_logging()
     logging.info("aisbench.log has been cleared for this run.")
     logging.info("aisbench_all.log separator added for this run.")
+
+    # 启动前快速校验 config：模板占位符 / 路径存在性（无网络依赖）
+    _check_config_placeholder("MODEL_PATH", MODEL_PATH)
+    if dataset_path_input == "none":
+        # 仅在工具自动生成数据集时才用到 DATASET_PATH；外部 --dataset 场景不应因其未改而退出
+        _check_config_placeholder("DATASET_PATH", DATASET_PATH)
+    _check_config_placeholder("WORK_PATH", WORK_PATH)
+    if not os.path.exists(MODEL_PATH):
+        logging.error(f"MODEL_PATH 不存在：{MODEL_PATH}，请修改 config.py 指向真实的模型权重/tokenizer 路径")
+        sys.exit(1)
+    if not os.path.isdir(WORK_PATH):
+        derived_work_path = None
+        try:
+            import ais_bench
+            derived_work_path = os.path.dirname(ais_bench.__file__)
+        except Exception as error:
+            logging.warning(f"尝试通过 import ais_bench 推导 WORK_PATH 失败: {error}")
+        if derived_work_path and os.path.isdir(derived_work_path):
+            WORK_PATH = derived_work_path
+            logging.warning(f"WORK_PATH 不存在，已根据 ais_bench 安装位置自动修正为：{WORK_PATH}")
+        else:
+            logging.error(
+                f"WORK_PATH 不存在：{WORK_PATH}，且无法自动推导。"
+                f"请执行 'pip show ais-bench-benchmark' 查看安装路径并修改 config.py 的 WORK_PATH"
+            )
+            sys.exit(1)
 
     # 变长参数校验
     if (length_mean is None) ^ (length_std is None):
@@ -402,13 +545,10 @@ if __name__ == '__main__':
     logging.info(f"length_min: {length_min}")
     logging.info(f"length_max: {length_max}")
 
-    # 区分流式和非流式
+    # 区分流式和非流式（--test_type 已由 argparse choices 限定为 text/stream）
     if test_type == "text":
         api_test_type = "VLLMCustomAPIChat"
         api_test_abbr = "vllm-api-general-chat"
-    elif test_type == "stream":
-        api_test_type = "VLLMCustomAPIChatStream"
-        api_test_abbr = "vllm-api-stream-chat"
     else:
         api_test_type = "VLLMCustomAPIChatStream"
         api_test_abbr = "vllm-api-stream-chat"
@@ -462,7 +602,7 @@ if __name__ == '__main__':
         logging.warning("[kv_stage] 混部形态不支持五阶段分析，已忽略 KV_STAGE_LOG_P/D 配置")
         kv_analyzer.enabled = False
     if kv_analyzer.enabled and not pd_monitor.enabled:
-        logging.warning("[kv_stage] 运行时监控未启用（*_LISTEN_SERVER 未配置），五阶段结果仅输出打屏与 CSV，不生成图 11")
+        logging.warning("[kv_stage] 运行时监控未启用（*_LISTEN_SERVER 未配置），五阶段结果仅输出打屏与 CSV，不生成图 3")
 
     def run_aisbench(cmd, phase):
         logging.info(f"test start ({phase}), use command: {cmd}")
@@ -474,16 +614,27 @@ if __name__ == '__main__':
                 logging.info("Captured full_dataset prefix-cache baseline (hits/queries), warmup excluded")
         if kv_analyzer.enabled:
             kv_analyzer.start()
+        # 独立进程组：超时时连同 `sh -c "ais_bench | tee"` 的子进程树一起终止，
+        # 否则只杀外层 shell，压测仍在后台打服务
+        proc = subprocess.Popen(cmd, shell=True, start_new_session=True)
         try:
-            subprocess.run(cmd, shell=True, check=True)
-        except subprocess.CalledProcessError:
+            return_code = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (AttributeError, OSError):
+                proc.kill()
+            proc.wait()
+            logging.error(f"阶段 {phase} 超时（{timeout}s），已终止进程组")
+            raise SystemExit(f"测试阶段 {phase} 超时（{timeout}s），请检查服务状态或增大 --timeout")
+        if return_code != 0:
             if "--summarizer stable_stage" in cmd:
                 logging.error(
                     "[稳态测试失败] ais_bench 未找到稳态窗口（Can not find a stable stage），"
                     "常见原因：数据量太小或并发未能两次打满。"
                     "可增大 --data_num，或将 config.py 的 DEFAULT_PERFORMANCE_TEST 改为 default_perf。"
                 )
-            raise
+            raise subprocess.CalledProcessError(return_code, cmd)
         if pd_monitor.enabled:
             plot_dir = resolve_plot_output_dir(OUTPUT_DIR, api_test_abbr)
             plot_now = find_aisbench_plot_html(plot_dir)
@@ -505,6 +656,7 @@ if __name__ == '__main__':
 
     try:
         # 执行命令
+        per_round_saved = False
         if dataset_type == "prefix_cache":
             # 前缀数据集测试
             if prefix_test:
@@ -513,6 +665,13 @@ if __name__ == '__main__':
                 else:
                     pod_info = POD_INFO
                 logging.info(f"pod_info: {pod_info}")
+                # 首次拉取指标前整体校验一次 POD_INFO，格式非法则立即失败退出
+                for _pod in pod_info:
+                    try:
+                        parse_endpoint(_pod)
+                    except ValueError as error:
+                        logging.error(str(error))
+                        sys.exit(1)
 
                 logging.info(f"[开始] 前缀数据集测试")
                 # 前缀测试: request rate 固定为 0
@@ -557,9 +716,14 @@ if __name__ == '__main__':
             modify_aisbench_api(concurrency,str(output_len))
             dst_file = generate_test_dataset(src_file_data, dst_dir)
             if test_times > 1:
+                per_round_saved = True
+                round_summarizer = DEFAULT_PERFORMANCE_TEST
                 for test_time in range(test_times):
                     logging.info(f"Execution rounds: {test_time + 1}")
                     run_aisbench(generate_aisbench_command(DEFAULT_PERFORMANCE_TEST), f"full_dataset_round_{test_time + 1}")
+                    # 每轮单独落一行（round 列记录轮次），避免只保留最后一轮
+                    save_result(request_rate, npu_num, extra_metrics=None,
+                                summarizer=round_summarizer, round_index=test_time + 1)
             else:
                 run_aisbench(generate_aisbench_command(DEFAULT_PERFORMANCE_TEST), "full_dataset")
             logging.info(f"[完成] 全量数据集测试完成，结果保存在aisbench_result.csv")
@@ -581,8 +745,21 @@ if __name__ == '__main__':
             kv_analyzer.write_details_csv(kv_perf_dir)
             if pd_monitor.enabled:
                 pd_monitor.set_kv_stage_data(kv_analyzer.build_bar_traces())
-        save_result(request_rate, npu_num, extra_metrics,
-                    summarizer="accuracy" if test_accuracy else DEFAULT_PERFORMANCE_TEST)
+        # 多轮模式已在每轮落行：汇总类指标（Prefix Hit Rate / 五阶段均值）属于全量聚合，
+        # 追加写入最后一轮行，避免被 `per_round_saved` 跳过而静默丢失
+        if per_round_saved:
+            if extra_metrics:
+                merged = merge_extra_metrics_into_csv("aisbench_result.csv", extra_metrics, test_times)
+                if merged:
+                    logging.info(
+                        f"多轮模式：已将聚合指标 {sorted(extra_metrics)} 写入第 {test_times} 轮行"
+                        "（Prefix Hit Rate 仅代表最后一轮全量统计，五阶段为全程聚合）"
+                    )
+                else:
+                    logging.error("多轮模式：聚合指标写入 CSV 失败，请检查 aisbench_result.csv")
+        else:
+            save_result(request_rate, npu_num, extra_metrics,
+                        summarizer="accuracy" if test_accuracy else DEFAULT_PERFORMANCE_TEST)
     finally:
         if pd_monitor.enabled:
             pd_monitor.stop()

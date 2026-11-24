@@ -1,3 +1,5 @@
+"""从 /metrics 抓取 RAW 累计计数器（prefix_cache_queries/hits_total）；
+命中率公式在 aisbench_test.cal_prefix_hit_info，文件名系历史遗留，勿改名。"""
 import logging
 import re
 import requests
@@ -40,24 +42,33 @@ def _get_prefix_cache_metrics(ip_address, port, metric_type):
 
             engine = engine_match.group(1)
 
-            # 提取最后一个数字
-            parts = line.split()
-            if len(parts) < 2:
-                continue
+            # 取标签块 '}' 之后的第一个数字字段，兼容 OpenMetrics exemplar / 时间戳后缀
+            brace_idx = line.rfind('}')
+            tail = line[brace_idx + 1:] if brace_idx != -1 else line
+            value = None
+            for tok in tail.split():
+                try:
+                    value = float(tok)
+                    break
+                except ValueError:
+                    continue
+            if value is None:
+                # 兜底：仍按原逻辑取最后一个字段
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+                try:
+                    value = float(parts[-1])
+                except ValueError:
+                    continue
+            if value.is_integer():
+                value = int(value)
 
-            value_str = parts[-1]
-            try:
-                value = float(value_str)
-                if value.is_integer():
-                    value = int(value)
-            except ValueError:
-                continue
-
-            # 根据指标名称分类
+            # 根据指标名称分类；同一 engine 出现在多行时对计数器求和而非覆盖
             if f'external_prefix_cache_{metric_type}_total' in line:
-                external_stats[int(engine)] = value
+                external_stats[int(engine)] = external_stats.get(int(engine), 0) + value
             elif f'vllm:prefix_cache_{metric_type}_total' in line:
-                normal_stats[int(engine)] = value
+                normal_stats[int(engine)] = normal_stats.get(int(engine), 0) + value
 
         logging.info(f"{metric_type}: normal={normal_stats}, external={external_stats}")
         return normal_stats, external_stats

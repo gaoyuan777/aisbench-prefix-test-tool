@@ -140,18 +140,66 @@ def save_log(aisbench_log, log_dir):
 
 
 def save_csv(ans, filename):
+    """追加/创建结果 CSV（原子写）。成功返回 True，失败记录日志并返回 False。"""
     file_exists = os.path.exists(filename)
     df_new = pd.DataFrame([ans])
+    # 先写临时文件再原子替换，避免 Ctrl-C 中断或并发写入时损坏 CSV
+    tmp_filename = filename + ".tmp"
     try:
+        df_existing = None
         if file_exists:
-            df_existing = pd.read_csv(filename)
+            try:
+                df_existing = pd.read_csv(filename)
+            except pd.errors.EmptyDataError:
+                # 0 字节/无表头的残留文件：直接按新建处理，而不是丢行
+                logging.warning(f"{filename} 为空文件，按新建处理")
+        if df_existing is not None:
             logging.info("文件已存在，读取现有数据")
             df_updated = pd.concat([df_existing, df_new], ignore_index=True)
             df_updated = df_updated.reindex(columns=df_existing.columns.union(df_new.columns, sort=False))
-            df_updated.to_csv(filename, index=False)
+            df_updated.to_csv(tmp_filename, index=False)
+            os.replace(tmp_filename, filename)
             logging.info("成功追加新行")
         else:
-            df_new.to_csv(filename, index=False)
+            df_new.to_csv(tmp_filename, index=False)
+            os.replace(tmp_filename, filename)
             logging.info("创建新文件并写入数据")
+        return True
     except Exception as e:
         logging.error(f"操作失败: {e}")
+        if os.path.exists(tmp_filename):
+            try:
+                os.remove(tmp_filename)
+            except OSError:
+                pass
+        return False
+
+
+def merge_extra_metrics_into_csv(filename, extra_metrics, round_index=None, column="round"):
+    """把聚合类指标（Prefix Hit Rate / 五阶段均值）写入指定轮次行（默认最后一行）。"""
+    if not extra_metrics or not os.path.exists(filename):
+        return False
+    tmp_filename = filename + ".tmp"
+    try:
+        df = pd.read_csv(filename)
+        if df.empty:
+            return False
+        if column in df.columns and round_index is not None:
+            mask = df[column].astype(str) == str(round_index)
+            if not mask.any():
+                mask = df.index == df.index[-1]
+        else:
+            mask = df.index == df.index[-1]
+        for key, value in extra_metrics.items():
+            df.loc[mask, key] = value
+        df.to_csv(tmp_filename, index=False)
+        os.replace(tmp_filename, filename)
+        return True
+    except Exception as e:
+        logging.error(f"合并附加指标到 {filename} 失败: {e}")
+        if os.path.exists(tmp_filename):
+            try:
+                os.remove(tmp_filename)
+            except OSError:
+                pass
+        return False
