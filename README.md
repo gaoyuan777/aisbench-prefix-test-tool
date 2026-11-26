@@ -10,7 +10,7 @@
 | --- | --- |
 | 性能测试 | 定长/不定长输入、流式/非流式、思考模式；`stable_stage`（稳态）/`default_perf`（全量）两种口径 |
 | Prefix Cache 测试 | 基于 GSM8K 自动构造"公共前缀 + 3 个唯一 token + 独立后缀"数据集；`--prefix_test` 先 warmup 再跑全量，按 DP 域统计命中率 |
-| 运行时监控 | 测试期间每秒采集 vLLM `/metrics`，产出单文件交互式 HTML（KV 占用、各 DP 队列、请求时间轴；图例可点击显隐并附 max/min/avg） |
+| 运行时监控 | 测试期间每秒采集 vLLM `/metrics`，产出单文件交互式 HTML（KV 占用、各 DP 队列、请求时间轴；图例可点击显隐并附 max/min/avg；在任一子图上框选时间段，其余子图同步缩放，双击复位） |
 | 五阶段耗时（可选） | PD 分离下解析 vLLM `REQ_STAGE_METRIC` 日志，输出 P 等待/P 执行/KV 拉取/D 等待/D 执行的水平分段时间线与逐请求 CSV |
 | 精度测试 | GSM8K 格式数据集精度评估 |
 

@@ -2284,6 +2284,15 @@ def write_metrics_html(
         if text.strip() == titles[-1].strip():
             anno.yshift = 14
 
+    # 时间轴联动：在任一子图上框选/缩放时间范围时，所有子图同步显示同一时间段
+    # （plotly 原生 matches 机制：同一 match 组的 x 轴共享 range、缩放/双击复位联动）
+    _x_axes = sorted(k for k in fig.layout.to_plotly_json() if re.fullmatch(r"xaxis\d*", k))
+    if len(_x_axes) > 1:
+        _master_x = "xaxis" if "xaxis" in _x_axes else _x_axes[0]
+        # matches 取值是轴引用简写（x / x2 …），不是 layout 键名（xaxis / xaxis2）
+        _master_ref = _master_x.replace("axis", "")
+        fig.update_layout(**{k: {"matches": _master_ref} for k in _x_axes if k != _master_x})
+
     fig.write_html(
         output_path,
         include_plotlyjs=True,
